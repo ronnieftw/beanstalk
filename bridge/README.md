@@ -93,6 +93,9 @@ Tapping the screen then shows the thread view and sends the (message read) recei
 
 Editing a message in Telegram sends the corrected text to the panel again.
 
+The panel only keeps the last three messages. Only Telegram has the full
+history. 
+
 Only the twenty emoji built into the firmware will render correctly.
 
 💩 💨 ❤ 😀 😂 😍 😘 😎 🤣 👍 👋 ⭐ 🎉 🍕 ⚽ 🦖 😴 🏠 🚗 ✅

@@ -125,6 +125,9 @@ A new message takes the whole panel, inverted, with `TOUCH TO REPLY` below
 it. Touching it returns to the thread view, where the message becomes the newest bubble.
 The sender receives `(message read)`.
 
+The panel only keeps the last three messages. Older ones are lost to the sands of
+time.
+
 ## Sending/Replying
 
 The user can send or reply to messages by clicking any of the reply buttons or the pre-loaded emoji buttons. Reply buttons start with 3 defaults but new sets can be loaded or customized in any message from the sender.
