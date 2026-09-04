@@ -1,0 +1,19 @@
+# ESPHome Device Builder's own files.
+.esphome/
+.device-builder*
+.receiver_peers.json
+.offloader_pairings.json
+.DS_Store
+
+# Real credentials. secrets.yaml.example is the tracked template.
+secrets.yaml
+
+# The live panel config. sticky.yaml.example is the tracked copy. Keep them in
+# step: a change made here and not mirrored there is invisible to anyone
+# reading the repo.
+sticky.yaml
+
+# Build output from a local esphome CLI, if one is ever used.
+*.bin
+*.elf
+__pycache__/

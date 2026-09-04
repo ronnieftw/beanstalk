@@ -1,0 +1,34 @@
+[Unit]
+Description=Beanstalk — Telegram bridge for the panel
+After=network-online.target
+Wants=network-online.target
+# Crash-looping should not hammer Telegram or the broker.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=beanstalk
+Group=beanstalk
+EnvironmentFile=/etc/beanstalk.env
+# The paired chat id and the pairing code live here. StateDirectory= makes it
+# the one path the service can write under ProtectSystem=strict.
+StateDirectory=beanstalk
+Environment=STATE_DIR=/var/lib/beanstalk
+ExecStart=/opt/beanstalk/venv/bin/python /opt/beanstalk/beanstalk.py
+Restart=always
+RestartSec=10
+
+# The service reads one env file and talks to two hosts.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

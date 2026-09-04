@@ -1,0 +1,119 @@
+#!/bin/bash
+# Install or update the bridge, on the Pi. Safe to re-run: a second run with a
+# new beanstalk.py next to it is how you deploy a change.
+#
+#   scp ~/Downloads/beanstalk.env bridge/beanstalk.py bridge/beanstalk.service \
+#       bridge/install-beanstalk <user@pi>:~/
+#   ssh <user@pi> './install-beanstalk'
+#
+# Only beanstalk.py is required on a re-run. beanstalk.env and beanstalk.service
+# are picked up if present and the installed copies stand if not.
+
+set -euo pipefail
+
+USER_NAME=beanstalk
+DIR=/opt/beanstalk
+STATE=/var/lib/beanstalk
+ENV=/etc/beanstalk.env
+UNIT=/etc/systemd/system/beanstalk.service
+HERE=$(cd "$(dirname "$0")" && pwd)
+
+die() { echo "error: $*" >&2; exit 1; }
+
+# Root is fine; sudo is then a no-op. Anything else needs sudo.
+SUDO=sudo
+if [ "$(id -u)" = 0 ]; then SUDO=; else command -v sudo >/dev/null || die "sudo is not installed"; fi
+
+[ "$(uname -s)" = "Linux" ] || die "this runs on the Pi, not on your laptop"
+command -v systemctl >/dev/null || die "no systemd here. This installs a systemd service."
+command -v python3 >/dev/null || die "python3 is not installed"
+# Raspberry Pi OS Lite ships python3 without venv support. Say so now rather
+# than half-creating a venv that every later run then trusts.
+python3 -c "import ensurepip" 2>/dev/null \
+    || die "python3 cannot make a venv. On Debian/Raspberry Pi OS: sudo apt install python3-venv"
+
+[ -f "$HERE/beanstalk.py" ] || die "beanstalk.py is not next to this script. scp it over first."
+[ -f "$HERE/beanstalk.service" ] || [ -f "$UNIT" ] \
+    || die "beanstalk.service is not here and none is installed. scp it over."
+[ -f "$HERE/beanstalk.env" ] || [ -f "$ENV" ] \
+    || die "beanstalk.env is not here and none is installed. Generate one with setup.html."
+
+# Say whether the code changed. Not a reason to stop: a re-run after a
+# partial install has to finish the install.
+if [ -f "$DIR/beanstalk.py" ] && [ "$(md5sum < "$HERE/beanstalk.py")" = "$($SUDO md5sum < "$DIR/beanstalk.py")" ]; then
+    echo "note: beanstalk.py is unchanged from the installed copy"
+fi
+
+echo "==> service account and directories"
+id "$USER_NAME" >/dev/null 2>&1 || $SUDO useradd --system --no-create-home \
+    --shell /usr/sbin/nologin --user-group "$USER_NAME"
+$SUDO mkdir -p "$DIR"
+# The service writes only here: the paired chat id and the pairing code.
+# systemd also creates it via StateDirectory=, but not before the first start.
+$SUDO install -d -o "$USER_NAME" -g "$USER_NAME" -m 750 "$STATE"
+
+echo "==> python environment"
+[ -x "$DIR/venv/bin/python" ] || $SUDO python3 -m venv "$DIR/venv"
+# No --upgrade: a re-run must not need the network when nothing changed.
+$SUDO "$DIR/venv/bin/pip" install --quiet paho-mqtt requests
+
+echo "==> bridge"
+# Root-owned and read-only to the service. The service does not write its own
+# code; beanstalk.service enforces that with ProtectSystem=strict.
+$SUDO install -o root -g root -m 644 "$HERE/beanstalk.py" "$DIR/beanstalk.py"
+
+if [ -f "$HERE/beanstalk.env" ]; then
+    echo "==> credentials"
+    $SUDO install -m 600 -o root -g root "$HERE/beanstalk.env" "$ENV"
+    # It has your bot token in a world-readable home directory.
+    shred -u "$HERE/beanstalk.env" 2>/dev/null || rm -f "$HERE/beanstalk.env"
+fi
+
+echo "==> service"
+[ -f "$HERE/beanstalk.service" ] && $SUDO install -o root -g root -m 644 "$HERE/beanstalk.service" "$UNIT"
+$SUDO systemctl daemon-reload
+$SUDO systemctl enable beanstalk >/dev/null 2>&1
+$SUDO systemctl restart beanstalk
+
+echo
+echo "==> waiting for the bridge"
+sleep 2
+
+# beanstalk.py prints exactly "PAIRING CODE: XXXX-0000" when it has no chat id.
+# Change that string in one place and you must change it in the other.
+code=""
+for _ in $(seq 1 20); do
+    log=$($SUDO journalctl -u beanstalk --since "-60s" --no-pager 2>/dev/null || true)
+    code=$(printf '%s\n' "$log" | sed -n 's/.*PAIRING CODE: \([A-Z0-9-]\{4,\}\).*/\1/p' | tail -1)
+    [ -n "$code" ] && break
+    printf '%s\n' "$log" | grep -q "Beanstalk is up" && break
+    $SUDO systemctl is-active --quiet beanstalk || break
+    sleep 1
+done
+
+echo
+if ! $SUDO systemctl is-active --quiet beanstalk; then
+    echo "The bridge is NOT running. The last thing it said:" >&2
+    echo >&2
+    $SUDO journalctl -u beanstalk -n 30 --no-pager >&2
+    exit 1
+fi
+
+if [ -n "$code" ]; then
+    cat <<EOF
+The bridge is running and waiting to be paired.
+
+  Send this to your bot in Telegram:   $code
+
+The first chat that sends it becomes the only chat the bridge will ever
+answer. Nothing else is ever replied to.
+EOF
+else
+    cat <<EOF
+The bridge is running. You should have "Beanstalk is up." in Telegram.
+
+If not, the log says why:
+
+  sudo journalctl -u beanstalk -f
+EOF
+fi

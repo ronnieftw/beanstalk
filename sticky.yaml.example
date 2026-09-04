@@ -1,0 +1,1968 @@
+# =============================================================================
+# sticky.yaml.example — the tracked copy of the panel config.
+#
+# Copy to sticky.yaml, which is gitignored. Everything you set lives in
+# secrets.yaml; this file needs no edits. Keep the two copies identical.
+#
+# Keep the .example suffix. ESPHome Device Builder adopts any file ending in
+# .yaml in this folder as a second device with the same name and OTA target.
+#
+# reTerminal Sticky — message board
+# =============================================================================
+# ESP32-S3R8, 8 MB octal PSRAM, 32 MB flash.
+#
+#   sticky/to_kid    subscribe   message rendered on screen
+#   sticky/from_kid  publish     touch zones and the OK button
+#   sticky/seen      publish     tapping an unread message
+#   sticky/jokes     subscribe   joke bundle, retained
+#   sticky/buttons        publish, retained   current reply labels
+#   sticky/jokes_active   publish, retained   current joke set
+#
+# Pins:
+#   ePaper 3.97" 800x480 SSD1677 SPI   clk 13 / mosi 14 / miso 12
+#   Buttons  UP=GPIO5  DOWN=GPIO6  OK=GPIO4
+#   Buzzer   GPIO48 PWM
+#   RTC      PCF8563  I2C @0x51
+#   Fuel     BQ27220  I2C @0x55
+#   Touch    GT911    I2C @0x5D, INT 21, RST 41
+#   Power    GPIO45 PWR_HOLD + GPIO46 PWR_LOCK must be HIGH at boot
+#   Mic      PDM  CLK=GPIO19 DATA=GPIO20, unused
+#
+# There is no speaker, only the buzzer. Audio cannot play on this hardware.
+# =============================================================================
+
+substitutions:
+  device_name: reterminal-sticky
+  friendly_name: "reTerminal_Sticky"
+  # Shown in the header and in the wifi-recovery text. Whatever the panel
+  # user calls the sender.
+  sender_name: !secret sender_name
+  # Read off the screen and found in a phone's wifi list.
+  ap_ssid: "Beanstalk Setup"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    - priority: 600
+      then:
+        - output.turn_on: pwr_hold
+        - output.turn_on: pwr_lock
+        - switch.turn_on: touch_power_enable
+        # Active LOW, declared inverted, so turn_on enables charging. Must be
+        # driven at boot. Undriven it initialises inactive and the battery
+        # never charges.
+        - output.turn_on: charge_enable
+        - pcf8563.read_time:
+    # Late redraw. Without this, a device that boots and never reaches the
+    # broker keeps showing the pre-reboot frame, including a stale "online".
+    - priority: -100
+      then:
+        - script.execute: redraw
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: ESP32S3
+  flash_size: 32MB
+  framework:
+    type: arduino
+    advanced:
+      enable_idf_experimental_features: true
+
+logger:
+  hardware_uart: UART0
+
+# =============================================================================
+# Fonts
+# =============================================================================
+
+# ESPHome bakes in only the glyphs you name. Inter has no emoji, so these come
+# from Noto Emoji and are merged into each font id with extras:, letting one
+# print() mix text and emoji.
+#
+# Use Noto Emoji, the monochrome outline family. Noto COLOR Emoji is a bitmap
+# font and renders nothing on a 1-bit panel.
+#
+# To add an emoji, add its \U + 8 hex digit codepoint below. Anything not in
+# this list draws as an empty box.
+
+.emoji_glyphs: &emoji_glyphs
+  file: "gfonts://Noto Emoji"
+  glyphs: ["\U0001F4A9", "\U0001F4A8", "\U00002764", "\U0001F600", "\U0001F602",
+           "\U0001F60D", "\U0001F618", "\U0001F60E", "\U0001F923", "\U0001F44D",
+           "\U0001F44B", "\U00002B50", "\U0001F389", "\U0001F355", "\U000026BD",
+           "\U0001F996", "\U0001F634", "\U0001F3E0", "\U0001F697", "\U00002705"]
+
+font:
+  - file: "gfonts://Inter@700"
+    id: font_tiny
+    size: 15
+    extras:
+      - <<: *emoji_glyphs
+  - file: "gfonts://Inter@700"
+    id: font_small
+    size: 20
+    extras:
+      - <<: *emoji_glyphs
+  - file: "gfonts://Inter@700"
+    id: font_medium
+    size: 32
+    extras:
+      - <<: *emoji_glyphs
+  - file: "gfonts://Inter@700"
+    id: font_large
+    size: 48
+    extras:
+      - <<: *emoji_glyphs
+  # Impact screen only. Big enough to read from the far side of a room.
+  - file: "gfonts://Inter@700"
+    id: font_impact
+    size: 56
+    extras:
+      - <<: *emoji_glyphs
+  # Jokes only. 40 is the largest size that keeps the longest built-in joke
+  # inside the thread area at 50px line height.
+  - file: "gfonts://Inter@700"
+    id: font_joke
+    size: 40
+    extras:
+      - <<: *emoji_glyphs
+
+# =============================================================================
+# Buses
+# =============================================================================
+
+spi:
+  clk_pin: GPIO13
+  mosi_pin: GPIO14
+  miso_pin: GPIO12
+
+i2c:
+  - id: i2c_sensor
+    scl: GPIO0
+    sda: GPIO1
+    frequency: 400kHz
+
+  - id: i2c_touch
+    scl: GPIO2
+    sda: GPIO3
+    frequency: 100kHz
+
+# =============================================================================
+# Power rails and buzzer
+# =============================================================================
+
+output:
+  # Power latch — must be HIGH or the device powers off
+  - platform: gpio
+    pin: GPIO45
+    id: pwr_hold
+
+  - platform: gpio
+    pin: GPIO46
+    id: pwr_lock
+
+  # 1000Hz is the resting pitch for plain beeps. The sound scripts retune this
+  # and always set it back.
+  - platform: ledc
+    pin: GPIO48
+    id: buzzer_pwm
+    frequency: 1000Hz
+
+  # Charger enable (active LOW: LOW = charging enabled)
+  - platform: gpio
+    pin:
+      number: GPIO39
+      inverted: true
+    id: charge_enable
+
+button:
+  # Exposed on the broker as
+  # sticky/button/restart_device/command, so the device can be rebooted
+  # remotely. Anything with broker credentials can press it.
+  #
+  # internal: true does NOT hide an MQTT topic in this ESPHome version. Adding
+  # it here does not hide the topic.
+  #
+  # The name is pinned. Renaming it breaks Beanstalk's /reboot.
+  - platform: restart
+    id: restart_device
+    name: "restart_device"
+
+switch:
+  - platform: gpio
+    pin: GPIO42
+    id: touch_power_enable
+    internal: true
+    restore_mode: ALWAYS_ON
+    setup_priority: 1100
+
+light:
+  # Buzzer as a monochromatic light: brightness = volume
+  - platform: monochromatic
+    output: buzzer_pwm
+    id: buzzer
+    internal: true
+    default_transition_length: 0s
+
+# =============================================================================
+# Battery
+# =============================================================================
+
+sensor:
+  - platform: template
+    id: battery_level
+    name: "Battery Level"
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 300s
+    lambda: |-
+      uint8_t reg = 0x2C;
+      uint8_t raw[2] = {0, 0};
+      auto err = id(i2c_sensor).write_readv(0x55, &reg, 1, raw, 2);
+      if (err != esphome::i2c::ERROR_OK) {
+        return NAN;
+      }
+      return static_cast<float>(static_cast<uint16_t>(raw[0]) | (static_cast<uint16_t>(raw[1]) << 8));
+
+  # DO NOT TRUST THIS NUMBER. Register 0x0C should be signed milliamps but
+  # reads a fixed 5755 mA — 7.7C into a 750 mAh cell. The gauge's sense
+  # resistor is probably unconfigured. The sign may be right; the magnitude is
+  # meaningless.
+  #
+  # Use state of charge at 0x2C for anything real.
+  - platform: template
+    id: battery_current
+    internal: true
+    unit_of_measurement: "mA"
+    accuracy_decimals: 0
+    update_interval: 300s
+    lambda: |-
+      uint8_t reg = 0x0C;
+      uint8_t raw[2] = {0, 0};
+      auto err = id(i2c_sensor).write_readv(0x55, &reg, 1, raw, 2);
+      if (err != esphome::i2c::ERROR_OK) {
+        return NAN;
+      }
+      uint16_t raw_value = static_cast<uint16_t>(raw[0]) | (static_cast<uint16_t>(raw[1]) << 8);
+      return static_cast<float>(static_cast<int16_t>(raw_value));
+
+# =============================================================================
+# Time — RTC is the source of truth, SNTP corrects its drift
+#
+# CHECK THIS: timezone is set to US Pacific. Change both entries if the panel
+# does not live there.
+# =============================================================================
+
+time:
+  - platform: pcf8563
+    i2c_id: i2c_sensor
+    id: rtc_time
+    address: 0x51
+    timezone: America/Los_Angeles
+    update_interval: never
+
+  - platform: sntp
+    timezone: America/Los_Angeles
+    on_time_sync:
+      then:
+        - pcf8563.write_time:
+
+# =============================================================================
+# Touch
+#
+# Portrait: display rotation: 90, touchscreen mirror_y: true.
+# All zone coordinates are portrait screen space, 480 x 800, matching the
+# display lambda.
+# =============================================================================
+
+touchscreen:
+  - platform: gt911
+    i2c_id: i2c_touch
+    id: sticky_touch
+    interrupt_pin: GPIO21
+    reset_pin: GPIO41
+    # Verified on device. X reads correctly, Y comes in inverted, so exactly
+    # one mirror is needed. No swap_xy.
+    #
+    # Do NOT correct a Y inversion with rotation: 270. That turns the panel 180
+    # degrees, flipping both axes and rendering the screen upside down.
+    transform:
+      mirror_y: true
+    # Serial only. The numbers to read if you move a touch zone.
+    on_touch:
+      - logger.log:
+          format: "Touch x=%d y=%d"
+          args: [touch.x, touch.y]
+
+
+# =============================================================================
+# Inputs — 480 x 800 portrait
+#
+#   message / impact   y   0 - 451   also dismisses an unread message
+#   reactions          y 452 - 530   4 columns, split at x120/240/360
+#   reply 1            y 531 - 622
+#   reply 2            y 623 - 708
+#   reply 3            y 709 - 800
+#
+# Zones tile their bands edge to edge. Gutters produce dead taps.
+#
+# Reply rows are taller than the pill they cover. Shrinking them costs taps.
+#
+# Vertical budget below the thread, drawn in the display lambda:
+#   428  thread BOT
+#   436  separator line
+#   438  "waiting to send" notice, only when a reply is queued
+#   466  reaction circles top, cy 496, r 30
+#   538  first reply pill top, 80 tall on an 86 pitch
+#
+# While a message is unread every zone acts as dismiss. See tap_reply.
+# =============================================================================
+
+
+binary_sensor:
+  - platform: touchscreen
+    touchscreen_id: sticky_touch
+    id: zone_message
+    internal: true
+    x_min: 0
+    x_max: 480
+    y_min: 0
+    y_max: 451
+    on_press:
+      then:
+        - script.execute: tap_message
+
+  - platform: touchscreen
+    touchscreen_id: sticky_touch
+    id: zone_react_1
+    internal: true
+    x_min: 0
+    x_max: 119
+    y_min: 452
+    y_max: 530
+    on_press:
+      then:
+        - script.execute:
+            id: tap_reply
+            slot: 4
+
+  - platform: touchscreen
+    touchscreen_id: sticky_touch
+    id: zone_react_2
+    internal: true
+    x_min: 120
+    x_max: 239
+    y_min: 452
+    y_max: 530
+    on_press:
+      then:
+        - script.execute: show_joke
+
+  - platform: touchscreen
+    touchscreen_id: sticky_touch
+    id: zone_react_3
+    internal: true
+    x_min: 240
+    x_max: 359
+    y_min: 452
+    y_max: 530
+    on_press:
+      then:
+        - script.execute:
+            id: tap_reply
+            slot: 5
+
+  - platform: touchscreen
+    touchscreen_id: sticky_touch
+    id: zone_react_4
+    internal: true
+    x_min: 360
+    x_max: 480
+    y_min: 452
+    y_max: 530
+    on_press:
+      then:
+        - script.execute:
+            id: tap_reply
+            slot: 6
+
+  - platform: touchscreen
+    touchscreen_id: sticky_touch
+    id: zone_reply_1
+    internal: true
+    x_min: 0
+    x_max: 480
+    y_min: 531
+    y_max: 622
+    on_press:
+      then:
+        - script.execute:
+            id: tap_reply
+            slot: 1
+
+  - platform: touchscreen
+    touchscreen_id: sticky_touch
+    id: zone_reply_2
+    internal: true
+    x_min: 0
+    x_max: 480
+    y_min: 623
+    y_max: 708
+    on_press:
+      then:
+        - script.execute:
+            id: tap_reply
+            slot: 2
+
+  - platform: touchscreen
+    touchscreen_id: sticky_touch
+    id: zone_reply_3
+    internal: true
+    x_min: 0
+    x_max: 480
+    y_min: 709
+    y_max: 800
+    on_press:
+      then:
+        - script.execute:
+            id: tap_reply
+            slot: 3
+
+  # ---- physical buttons ---------------------------------------------------
+  # UP forces a redraw. Useful when the screen looks wrong and you want to know
+  # whether the device is alive.
+  - platform: gpio
+    pin:
+      number: GPIO5
+      mode: INPUT_PULLUP
+      inverted: true
+    id: button_up
+    internal: true
+    on_press:
+      then:
+        - logger.log: "Button UP pressed - forcing redraw"
+        - script.execute: redraw
+
+  # DOWN toggles sound.
+  - platform: gpio
+    pin:
+      number: GPIO6
+      mode: INPUT_PULLUP
+      inverted: true
+    id: button_down
+    internal: true
+    on_press:
+      then:
+        - lambda: 'id(sound_on) = !id(sound_on);'
+        # Audible only when turning sound on. Muting is confirmed on screen.
+        - script.execute: sound_beep
+        - script.execute: redraw
+
+  # OK is the deep-sleep wake source, the physical fallback for the touch
+  # zones, and a long hold restarts the device.
+  #
+  # This hold is the only manual restart. Seeed's documented power button
+  # combos are in their firmware and do not work under ESPHome: a 10s hold
+  # does nothing, and UP+DOWN redraws and toggles mute.
+  #
+  # Restart, not power off. Nothing here can power the device back on.
+  - platform: gpio
+    pin:
+      number: GPIO4
+      mode: INPUT_PULLUP
+      inverted: true
+    id: button_ok
+    internal: true
+    # The warning beeps must run from on_press. on_click fires on release, so
+    # beeps there would be a receipt rather than a warning.
+    on_press:
+      - script.execute: restart_warn
+    on_release:
+      - script.stop: restart_warn
+      # Stopping mid-beep would otherwise leave the buzzer on.
+      - light.turn_off: buzzer
+    on_click:
+      - min_length: 400ms
+        max_length: 2s
+        then:
+          - script.execute:
+              id: tap_reply
+              slot: 0
+      # Beeps end at 4.8s and this window opens at 5s, so releasing just after
+      # them restarts. Releasing between 2s and 5s does nothing.
+      - min_length: 5s
+        max_length: 20s
+        then:
+          - button.press: restart_device
+
+# =============================================================================
+# State
+# =============================================================================
+
+globals:
+  - id: message
+    type: std::string
+    restore_value: yes
+    max_restore_data_length: 240
+    initial_value: '""'
+
+  - id: msg_time
+    type: time_t
+    restore_value: yes
+    initial_value: '0'
+
+  - id: msg_seen
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
+
+  - id: last_sync
+    type: time_t
+    restore_value: no
+    initial_value: '0'
+
+  # Last outbound result, shown under the message. The only feedback that a tap
+  # left the device.
+  - id: ack_text
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: ack_time
+    type: time_t
+    restore_value: no
+    initial_value: '0'
+
+  # Held when the broker is unreachable, flushed on the next MQTT connect.
+  - id: pending_reply
+    type: std::string
+    restore_value: yes
+    max_restore_data_length: 48
+    initial_value: '""'
+
+  - id: tap_label
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: tap_sound
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: last_tap_label
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: last_tap_at
+    type: time_t
+    restore_value: no
+    initial_value: '0'
+
+  # Reply labels. Set by a "?a, b, c" line over MQTT and kept until changed.
+  # These three are the defaults, and what /buttons default restores.
+  #
+  # Changing them means changing TWO places in this file: these initial_values
+  # and the bare-"?" reset branch in the sticky/to_kid handler. The bridge
+  # holds no copy; /buttons default sends a bare "?".
+  - id: reply1
+    type: std::string
+    restore_value: yes
+    max_restore_data_length: 32
+    initial_value: '"miss you"'
+  - id: reply2
+    type: std::string
+    restore_value: yes
+    max_restore_data_length: 32
+    initial_value: '"call me"'
+  - id: reply3
+    type: std::string
+    restore_value: yes
+    max_restore_data_length: 32
+    initial_value: '"goodnight"'
+
+  # Joke mode. Does not touch the stored message.
+  # Broker link state, maintained by the MQTT on_connect / on_disconnect
+  # triggers. The display reads this rather than calling into the MQTT client,
+  # because no C++ accessor for it is documented.
+  - id: link_up
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # millis() at the last MQTT connect, and a flag the incoming handler sets to
+  # skip the actions after its lambda. See the retained-message guard on the
+  # sticky/to_kid text_sensor.
+  - id: mqtt_up_at
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: ignore_incoming
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # Set when the payload was only a "?" button command: redraw, but no beep,
+  # no thread entry, no impact screen.
+  - id: buttons_only
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # Set on connect, cleared once the triad has been published by the interval.
+  # A publish issued from inside on_connect never reaches the broker.
+  - id: buttons_dirty
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # Is the fallback AP up, as reported by the captive portal itself. Separate
+  # from link_up, the BROKER link: wifi can be up while the broker is not, and
+  # the two recover differently.
+  - id: ap_hint
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: ap_changed
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: ap_up_since
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  # The built-in jokes. One per line, "|" as a display break, the same format
+  # a pushed bundle uses.
+  #
+  # A global rather than a C array in the display lambda, so publish_jokes_active
+  # can send them to the bridge. Beanstalk appends to this set.
+  - id: jokes_builtin
+    type: std::string
+    restore_value: no
+    initial_value: |-
+      R"(What do you call a fart | from a fancy person? | A refined gas.
+      What is invisible and | smells like carrots? | Bunny farts.
+      Why don't skeletons | fart in public? | They don't have the guts.
+      What do you call a dinosaur | that farts a lot? | A Blast-o-saurus.
+      What did one butt cheek | say to the other? | Together we can stop this stink.
+      What do you call a fart | in a spacesuit? | A private jet.
+      What is a fart's | favourite music? | Wind instruments.
+      Why did the toilet paper | roll down the hill? | To get to the bottom.
+      What did the poop | say to the fart? | You blow me away.
+      What do you call | a sleeping fart? | A silent but deadly nap.
+      Why did the fart go to school? | To get a little smarter | and a lot louder.
+      What do you call a fart | that plays guitar? | A toot-sician.
+      Why was the belly button sad? | It always got left | in the middle.
+      What is brown and | sounds like a bell? | DUNG.
+      Why did the banana | go to the doctor? | It was not peeling well.
+      What do you call cheese | that is not yours? | Nacho cheese.
+      Why can't your nose | be 12 inches long? | Then it would be a foot.
+      Why don't eggs tell jokes? | They would crack each other up.
+      What happened to the burp | that wanted to be a fart? | It just couldn't make it up.
+      Why did the kid bring | a ladder to school? | To get to high school.)"
+
+  # A joke bundle pushed over MQTT. One joke per line, "|" as a display break.
+  #
+  # RAM only. A restorable global caps at 254 bytes and twenty jokes is ~1.8KB,
+  # so flash is not an option. The retained message on sticky/jokes is the
+  # persistence: the broker redelivers it seconds after a reboot.
+  #
+  # Empty falls back to jokes_builtin, so the joke button works with no broker.
+  - id: jokes
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+
+  # Mute. Restored across reboots: a device silenced at bedtime stays silent.
+  #
+  # Enforced by every buzzer brightness being a lambda that returns 0 when
+  # muted, not by conditions around each sound script. A new sound is silent
+  # when muted, with no condition to add.
+  - id: sound_on
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
+
+  # The link state as of the LAST ACTUAL RENDER, set inside the display lambda.
+  # show_offline compares against it so it redraws when the screen is lying and
+  # stays quiet when it is already correct.
+  - id: link_shown
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # The conversation. Records separated by 0x1E, fields by 0x1F:
+  #   who(M|K) 0x1F unix_time 0x1F text
+  #
+  # Three records only. A scrollback rewards checking the device, which this
+  # design avoids.
+  #
+  # ESPHome caps a restored global at 254 bytes:
+  #   3 x (1 who + 1 sep + 10 unix + 1 sep + 64 text) + 2 separators = 233
+  # 64 chars is also what a bubble shows at 32px across 3 lines.
+  - id: thread
+    type: std::string
+    restore_value: yes
+    max_restore_data_length: 250
+    initial_value: '""'
+
+  # Bridges the inbound parsing lambda to the thread_add call after it.
+  - id: incoming_text
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+
+  - id: showing_joke
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: joke_idx
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+# =============================================================================
+# Sounds
+#
+# The buzzer is a small transducer with a resonant band and low pitches are
+# nearly silent on it. If the fart is too quiet, raise every frequency in
+# sound_fart together. The shape matters more than the absolute pitch.
+# =============================================================================
+
+script:
+  # ===========================================================================
+  # All redraws go through here.
+  #
+  # component.update only marks the display dirty; the refresh runs in the
+  # component's own loop and takes up to 2.6s. The delay must exceed that or a
+  # queued second run starts mid-refresh and logs
+  # "Display already in state POWER_OFF". If that error appears, raise the
+  # delay rather than looking elsewhere.
+  #
+  # queued with max_runs 3 drops anything beyond two held runs. Safe: every
+  # redraw renders current globals, so a held one shows the latest state.
+  # ===========================================================================
+  - id: redraw
+    mode: queued
+    max_runs: 3
+    then:
+      - component.update: epaper_display
+      - delay: 3000ms
+
+  # Four seconds of silence, then three beeps, while the OK button is held.
+  # Stopped on release, so it is a warning you can back out of rather than a
+  # countdown you cannot.
+  - id: restart_warn
+    mode: restart
+    then:
+      - delay: 4s
+      - light.turn_on:
+          id: buzzer
+          brightness: !lambda 'return id(sound_on) ? 0.60f : 0.0f;'
+      - delay: 120ms
+      - light.turn_off: buzzer
+      - delay: 80ms
+      - light.turn_on:
+          id: buzzer
+          brightness: !lambda 'return id(sound_on) ? 0.60f : 0.0f;'
+      - delay: 120ms
+      - light.turn_off: buzzer
+      - delay: 80ms
+      - light.turn_on:
+          id: buzzer
+          brightness: !lambda 'return id(sound_on) ? 0.60f : 0.0f;'
+      - delay: 240ms
+      - light.turn_off: buzzer
+
+  # The device owns the reply triad; it survives reboots in flash and the
+  # bridge does not. Published retained, so the bridge reads the real labels
+  # the moment it subscribes, including after a bridge restart.
+  #
+  # Retained is safe here: nothing on the device subscribes to this topic, so
+  # a replay cannot feed back in.
+  # What the device is showing: a pushed bundle if there is one, the built-in
+  # twenty otherwise. The bridge reads this so /joke appends to the real list.
+  #
+  # A separate topic from sticky/jokes. That one is the inbox the
+  # bridge writes to; this one is the device reporting out. Nothing on the
+  # device subscribes here, so retaining it cannot feed back in.
+  - id: publish_jokes_active
+    mode: single
+    then:
+      - mqtt.publish:
+          topic: sticky/jokes_active
+          payload: !lambda 'return id(jokes).empty() ? id(jokes_builtin) : id(jokes);'
+          qos: 1
+          retain: true
+
+  - id: publish_buttons
+    mode: single
+    then:
+      - mqtt.publish:
+          topic: sticky/buttons
+          payload: !lambda 'return id(reply1) + " | " + id(reply2) + " | " + id(reply3);'
+          qos: 1
+          retain: true
+
+  - id: sound_beep
+    mode: single
+    then:
+      - light.turn_on:
+          id: buzzer
+          brightness: !lambda 'return id(sound_on) ? 0.50f : 0.0f;'
+      - delay: 150ms
+      - light.turn_off: buzzer
+
+  - id: sound_fart
+    mode: single
+    then:
+      - output.ledc.set_frequency:
+          id: buzzer_pwm
+          frequency: 620Hz
+      - light.turn_on:
+          id: buzzer
+          brightness: !lambda 'return id(sound_on) ? 0.75f : 0.0f;'
+      - delay: 60ms
+      - output.ledc.set_frequency:
+          id: buzzer_pwm
+          frequency: 430Hz
+      - delay: 70ms
+      - output.ledc.set_frequency:
+          id: buzzer_pwm
+          frequency: 530Hz
+      - delay: 50ms
+      - output.ledc.set_frequency:
+          id: buzzer_pwm
+          frequency: 360Hz
+      - delay: 90ms
+      - output.ledc.set_frequency:
+          id: buzzer_pwm
+          frequency: 300Hz
+      - delay: 110ms
+      - output.ledc.set_frequency:
+          id: buzzer_pwm
+          frequency: 250Hz
+      - delay: 170ms
+      - light.turn_off: buzzer
+      - output.ledc.set_frequency:
+          id: buzzer_pwm
+          frequency: 1000Hz
+
+  - id: sound_chirp
+    mode: single
+    then:
+      - output.ledc.set_frequency:
+          id: buzzer_pwm
+          frequency: 880Hz
+      - light.turn_on:
+          id: buzzer
+          brightness: !lambda 'return id(sound_on) ? 0.50f : 0.0f;'
+      - delay: 120ms
+      - output.ledc.set_frequency:
+          id: buzzer_pwm
+          frequency: 1320Hz
+      - delay: 170ms
+      - light.turn_off: buzzer
+      - output.ledc.set_frequency:
+          id: buzzer_pwm
+          frequency: 1000Hz
+
+  - id: play_sound
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: 'return id(tap_sound) == 1;'
+          then:
+            - script.execute: sound_fart
+            - script.wait: sound_fart
+          else:
+            - if:
+                condition:
+                  lambda: 'return id(tap_sound) == 2;'
+                then:
+                  - script.execute: sound_chirp
+                  - script.wait: sound_chirp
+                else:
+                  - script.execute: sound_beep
+                  - script.wait: sound_beep
+
+  # ===========================================================================
+  # Outbound
+  # ===========================================================================
+
+  # Slot map:
+  #   0    OK button fallback
+  #   1-3  reply pills, labels from reply1/2/3
+  #   4-6  reaction circles, fixed
+  - id: thread_add
+    mode: single
+    parameters:
+      who: string
+      text: string
+    then:
+      - lambda: |-
+          const int THREAD_MAX = 3;
+          const size_t TEXT_MAX = 64;
+          if (text.empty()) return;
+
+          // Trim on a UTF-8 boundary — emoji are four bytes and half of one
+          // renders as garbage.
+          std::string body = text;
+          if (body.size() > TEXT_MAX) {
+            body.resize(TEXT_MAX);
+            while (!body.empty() &&
+                   (static_cast<unsigned char>(body.back()) & 0xC0) == 0x80)
+              body.erase(body.size() - 1);
+            if (!body.empty() &&
+                (static_cast<unsigned char>(body.back()) & 0x80) &&
+                (static_cast<unsigned char>(body.back()) & 0x40))
+              body.erase(body.size() - 1);
+          }
+          time_t now = id(rtc_time).now().is_valid() ? id(rtc_time).now().timestamp : 0;
+
+          std::string rec = who + std::string(1, '\x1F') +
+                            esphome::to_string((long) now) + std::string(1, '\x1F') + body;
+
+          std::vector<std::string> recs;
+          std::string s = id(thread);
+          size_t pos = 0;
+          while (pos <= s.size() && !s.empty()) {
+            size_t e = s.find('\x1E', pos);
+            if (e == std::string::npos) e = s.size();
+            if (e > pos) recs.push_back(s.substr(pos, e - pos));
+            if (e >= s.size()) break;
+            pos = e + 1;
+          }
+          recs.push_back(rec);
+          while ((int) recs.size() > THREAD_MAX) recs.erase(recs.begin());
+
+          std::string out;
+          for (size_t i = 0; i < recs.size(); i++) {
+            if (i) out += '\x1E';
+            out += recs[i];
+          }
+          // Guard the restore buffer. Drop from the oldest end if we overflow.
+          while (out.size() > 240 && recs.size() > 1) {
+            recs.erase(recs.begin());
+            out.clear();
+            for (size_t i = 0; i < recs.size(); i++) { if (i) out += '\x1E'; out += recs[i]; }
+          }
+          id(thread) = out;
+
+  - id: tap_reply
+    mode: single
+    parameters:
+      slot: int
+    then:
+      # An unread message covers the whole screen but the touch bands stay
+      # live underneath. Without this guard a tap there sends a label nobody
+      # can see and skips the sticky/seen publish. tap_message owns reading.
+      - if:
+          condition:
+            lambda: 'return !id(msg_seen) && !id(message).empty();'
+          then:
+            - script.execute: tap_message
+          else:
+            - lambda: |-
+                std::string label;
+                int snd = 0;
+                switch (slot) {
+                  case 0: label = "thinking of you"; break;
+                  case 1: label = id(reply1); break;
+                  case 2: label = id(reply2); break;
+                  case 3: label = id(reply3); break;
+                  // These strings are what lands on the sender's phone, which
+                  // has full emoji support, so they carry the emoji too.
+                  case 4: label = "PFFFFT! \xF0\x9F\x92\xA8";    snd = 1; break;
+                  case 5: label = "HAHAHAHA! \xF0\x9F\x98\x82";  snd = 0; break;
+                  case 6: label = "I love you \xE2\x9D\xA4";     snd = 2; break;
+                  default: label = ""; break;
+                }
+                id(tap_sound) = snd;
+
+                // Make a noise but send nothing when the label is empty, or when
+                // the same button was pressed within REPEAT_S seconds. The RTC is
+                // second-resolution, so 1 blocks same-second presses only.
+                //
+                // The real ceiling is the display. A send triggers a ~2s blocking
+                // redraw, so a held button sends about once every two seconds
+                // whatever this is set to.
+                const int REPEAT_S = 1;
+                time_t t = id(rtc_time).now().is_valid() ? id(rtc_time).now().timestamp : 0;
+                bool repeat = (label == id(last_tap_label)) && t > 0 && (t - id(last_tap_at)) < REPEAT_S;
+                if (label.empty() || repeat) {
+                  id(tap_label) = "";
+                } else {
+                  id(tap_label) = label;
+                  id(last_tap_label) = label;
+                  id(last_tap_at) = t;
+                }
+            - script.execute: play_sound
+            - script.wait: play_sound
+            - if:
+                condition:
+                  lambda: 'return !id(tap_label).empty();'
+                then:
+                  - lambda: |-
+                      id(pending_reply) = id(tap_label);
+                      id(msg_seen) = true;
+                      id(showing_joke) = false;
+                  - script.execute: flush_reply
+                  - script.execute: redraw
+
+  # Retry loop for a queued reply, driven by the 15s interval.
+  #
+  # NEVER publish from the MQTT on_connect trigger. The mqtt.connected
+  # condition reads false inside it, and an unconditional publish there does
+  # not reach the wire either. A poll finds a settled connection and retries.
+  #
+  # "sent" means mqtt.publish was called while connected. ESPHome exposes no
+  # PUBACK, so it is not proof the broker holds the message.
+  - id: try_flush
+  #
+  # "sent" means handed to the MQTT client while connected, not acknowledged by
+  # the broker. A publish onto a connection that dies a second later still
+  # reports as sent.
+    mode: single
+    then:
+      - if:
+          condition:
+            and:
+              - lambda: 'return !id(pending_reply).empty();'
+              - mqtt.connected:
+          then:
+            - mqtt.publish:
+                topic: sticky/from_kid
+                payload: !lambda 'return id(pending_reply);'
+                qos: 1
+                retain: false
+            - script.execute:
+                id: thread_add
+                who: !lambda 'return "K";'
+                text: !lambda 'return id(pending_reply);'
+            - lambda: |-
+                id(ack_text) = "sent: " + id(pending_reply);
+                id(ack_time) = id(rtc_time).now().is_valid() ? id(rtc_time).now().timestamp : 0;
+                id(pending_reply) = "";
+            - script.execute: redraw
+
+  # Called from a tap. The connected check is legitimate here: a false negative
+  # queues the reply rather than losing it.
+  - id: flush_reply
+    mode: single
+    then:
+      - if:
+          condition:
+            and:
+              - lambda: 'return !id(pending_reply).empty();'
+              - mqtt.connected:
+          then:
+            - mqtt.publish:
+                topic: sticky/from_kid
+                payload: !lambda 'return id(pending_reply);'
+                qos: 1
+                retain: false
+            # Both flush paths publish, so both must record. This is the path
+            # every tap takes while online.
+            - script.execute:
+                id: thread_add
+                who: !lambda 'return "K";'
+                text: !lambda 'return id(pending_reply);'
+            - lambda: |-
+                id(ack_text) = "sent: " + id(pending_reply);
+                id(ack_time) = id(rtc_time).now().is_valid() ? id(rtc_time).now().timestamp : 0;
+                id(pending_reply) = "";
+          else:
+            - lambda: |-
+                if (!id(pending_reply).empty()) {
+                  id(ack_text) = "NOT SENT YET - waiting to send: " + id(pending_reply);
+                  id(ack_time) = id(rtc_time).now().is_valid() ? id(rtc_time).now().timestamp : 0;
+                }
+
+  # ===========================================================================
+  # Message area tap
+  # ===========================================================================
+
+  - id: tap_message
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: 'return id(showing_joke);'
+          then:
+            - lambda: 'id(showing_joke) = false;'
+            - script.execute: redraw
+          else:
+            - if:
+                condition:
+                  lambda: 'return !id(msg_seen) && !id(message).empty();'
+                then:
+                  - lambda: |-
+                      id(msg_seen) = true;
+                      id(tap_sound) = 0;
+                  - script.execute: play_sound
+                  - script.wait: play_sound
+                  - mqtt.publish:
+                      topic: sticky/seen
+                      payload: "read"
+                      qos: 1
+                      retain: false
+                  - script.execute: redraw
+
+  # ===========================================================================
+  # Jokes. This only advances an index; the text lives in jokes_builtin or the
+  # pushed bundle, so there is no count to keep in sync in two places.
+  # ===========================================================================
+
+  - id: show_joke
+    mode: single
+    then:
+      # Same guard as tap_reply. The impact branch returns early while
+      # msg_seen is false, so setting showing_joke there redraws nothing.
+      - if:
+          condition:
+            lambda: 'return !id(msg_seen) && !id(message).empty();'
+          then:
+            - script.execute: tap_message
+          else:
+            - lambda: |-
+                id(joke_idx) = id(joke_idx) + 1 + (random_uint32() % 5);
+                id(showing_joke) = true;
+                id(tap_sound) = 0;
+            - script.execute: play_sound
+            - script.wait: play_sound
+            # An event, not a reply. Not routed through pending_reply: no
+            # thread entry, no queueing, no repeat guard. A dropped one is not
+            # missed.
+            - if:
+                condition:
+                  mqtt.connected:
+                then:
+                  - mqtt.publish:
+                      topic: sticky/from_kid
+                      payload: "(read a joke)"
+                      qos: 1
+                      retain: false
+            - script.execute: redraw
+
+  # ===========================================================================
+  # OFFLINE appears 30s after the link first drops.
+  # ===========================================================================
+
+  # mode: single, NOT restart. With restart, every disconnect resets the timer,
+  # so a link flapping faster than 30s never lets it finish and the screen never
+  # says OFFLINE. Reconnecting cancels this via script.stop in on_connect.
+  #
+  # The link_shown guard stops a redraw every 30s during a long outage. It draws
+  # only when the screen disagrees with reality.
+  - id: show_offline
+    mode: single
+    then:
+      - delay: 30s
+      - if:
+          condition:
+            lambda: 'return id(link_shown) != id(link_up);'
+          then:
+            - script.execute: redraw
+
+# =============================================================================
+# The clock on an e-ink panel is wrong unless something redraws it. First thing
+# to remove if MQTT goes unstable.
+# =============================================================================
+
+interval:
+  - interval: 15min
+    then:
+      - script.execute: redraw
+
+  # Drives the queued-reply retry. A reply tapped while offline goes out within
+  # 15s of the link returning, and a failed attempt is retried rather than
+  # lost.
+  - interval: 15s
+    then:
+      - script.execute: try_flush
+      # Is the fallback AP up, and has it been up long enough to say so.
+      #
+      # Whether it is up comes from the captive portal, which starts and stops
+      # with the AP. Do not infer it from a timer: the AP failing to start is
+      # the case worth knowing about, and a timer would hide it.
+      #
+      # 15 minutes because the AP runs concurrently with reconnection attempts,
+      # so the AP being up does not mean anyone needs to act. A shorter timer
+      # would blank the thread and redraw it for an outage that heals itself.
+      - lambda: |-
+          const uint32_t AP_HINT_AFTER_MS = 15 * 60 * 1000;
+          bool up = captive_portal::global_captive_portal != nullptr &&
+                    captive_portal::global_captive_portal->is_active();
+          if (!up) {
+            id(ap_up_since) = 0;
+          } else if (id(ap_up_since) == 0) {
+            id(ap_up_since) = millis();
+          }
+          bool want = up && id(ap_up_since) != 0 &&
+                      (uint32_t)(millis() - id(ap_up_since)) >= AP_HINT_AFTER_MS;
+          id(ap_changed) = (want != id(ap_hint));
+          id(ap_hint) = want;
+      - if:
+          condition:
+            lambda: 'return id(ap_changed);'
+          then:
+            - script.execute: redraw
+
+      # State reported out after a connect. Not in on_connect, where a publish
+      # never reaches the broker.
+      - if:
+          condition:
+            and:
+              - lambda: 'return id(buttons_dirty);'
+              - mqtt.connected:
+          then:
+            - script.execute: publish_buttons
+            - script.execute: publish_jokes_active
+            - lambda: 'id(buttons_dirty) = false;'
+
+# =============================================================================
+# Display — 480 x 800 portrait
+#
+# Redraws only when something changes. No periodic refresh beyond the clock.
+#
+#     0 -  64   header: name, mute state, link dot or OFFLINE, battery
+#    76 - 428   thread, joke, or wifi hint
+#         436   separator
+#   466 - 526   four reaction circles
+#   538 - 790   three reply pills
+#
+# The impact screen for an unread message returns early and shares none of
+# these coordinates.
+# =============================================================================
+
+display:
+  - platform: epaper_spi
+    id: epaper_display
+    model: seeed-reterminal-sticky
+    rotation: 90
+    update_interval: never
+    lambda: |-
+      ESP_LOGD("display", "=== refresh ===");
+
+      const int W = 480, H = 800;
+
+      // ---------------- helpers ----------------
+      static const char *DOW[7] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+      static const char *MON[12] = {"Jan","Feb","Mar","Apr","May","Jun",
+                                    "Jul","Aug","Sep","Oct","Nov","Dec"};
+      auto hhmm = [](ESPTime t) -> std::string {
+        int h = t.hour % 12; if (h == 0) h = 12;
+        char b[16];
+        snprintf(b, sizeof(b), "%d:%02d %s", h, t.minute, t.hour < 12 ? "AM" : "PM");
+        return std::string(b);
+      };
+      auto pop_utf8 = [](std::string &s) {
+        if (s.empty()) return;
+        size_t i = s.size() - 1;
+        while (i > 0 && (static_cast<unsigned char>(s[i]) & 0xC0) == 0x80) i--;
+        s.erase(i);
+      };
+      auto text_w = [&](const std::string &s, decltype(id(font_small)) f) -> int {
+        int x1, y1, w, h;
+        it.get_text_bounds(0, 0, s.c_str(), f, TextAlign::TOP_LEFT, &x1, &y1, &w, &h);
+        return w;
+      };
+      auto fit = [&](std::string s, decltype(id(font_small)) f, int max_w) -> std::string {
+        if (text_w(s, f) <= max_w) return s;
+        while (s.size() > 1 && text_w(s + "..", f) > max_w) pop_utf8(s);
+        return s + "..";
+      };
+      auto wrap = [&](const std::string &text, decltype(id(font_small)) f,
+                      int max_w) -> std::vector<std::string> {
+        std::vector<std::string> out;
+        std::string cur, word;
+        std::string s = text; s.push_back('\n');
+        for (char c : s) {
+          if (c == ' ' || c == '\n' || c == '\r') {
+            if (!word.empty()) {
+              while (text_w(word, f) > max_w && word.size() > 1) {
+                std::string head = word;
+                while (head.size() > 1 && text_w(head, f) > max_w) pop_utf8(head);
+                if (!cur.empty()) { out.push_back(cur); cur.clear(); }
+                out.push_back(head);
+                word.erase(0, head.size());
+              }
+              std::string trial = cur.empty() ? word : cur + " " + word;
+              if (!cur.empty() && text_w(trial, f) > max_w) { out.push_back(cur); cur = word; }
+              else cur = trial;
+              word.clear();
+            }
+            if (c == '\n') { out.push_back(cur); cur.clear(); }
+          } else word.push_back(c);
+        }
+        while (!out.empty() && out.back().empty()) out.pop_back();
+        return out;
+      };
+
+      // Rounded rectangles. Filled is cheap; the outline draws its corners as
+      // circles clipped to one quadrant each, because there is no arc primitive.
+      auto rfill = [&](int x, int y, int w, int h, int r, Color c) {
+        it.filled_rectangle(x + r, y, w - 2 * r, h, c);
+        it.filled_rectangle(x, y + r, w, h - 2 * r, c);
+        it.filled_circle(x + r, y + r, r, c);
+        it.filled_circle(x + w - r - 1, y + r, r, c);
+        it.filled_circle(x + r, y + h - r - 1, r, c);
+        it.filled_circle(x + w - r - 1, y + h - r - 1, r, c);
+      };
+      auto rline = [&](int x, int y, int w, int h, int r, Color c) {
+        it.line(x + r, y, x + w - r, y, c);
+        it.line(x + r, y + h - 1, x + w - r, y + h - 1, c);
+        it.line(x, y + r, x, y + h - r, c);
+        it.line(x + w - 1, y + r, x + w - 1, y + h - r, c);
+        it.start_clipping(x, y, x + r, y + r);
+        it.circle(x + r, y + r, r, c);
+        it.end_clipping();
+        it.start_clipping(x + w - r - 1, y, x + w - 1, y + r);
+        it.circle(x + w - r - 1, y + r, r, c);
+        it.end_clipping();
+        it.start_clipping(x, y + h - r - 1, x + r, y + h - 1);
+        it.circle(x + r, y + h - r - 1, r, c);
+        it.end_clipping();
+        it.start_clipping(x + w - r - 1, y + h - r - 1, x + w - 1, y + h - 1);
+        it.circle(x + w - r - 1, y + h - r - 1, r, c);
+        it.end_clipping();
+      };
+      // A t-pixel ring: fill the shape, then punch a smaller one out of it in
+      // the background colour. Do not build one by nesting two rline outlines
+      // a pixel apart — the corner arcs are separate Bresenham circles and
+      // print with visible breaks where they meet the straight edges.
+      //
+      // Draw this BEFORE the text inside it. The punch-out paints the interior
+      // background and erases anything already there.
+      auto rring = [&](int x, int y, int w, int h, int r, int t, Color c) {
+        rfill(x, y, w, h, r, c);
+        rfill(x + t, y + t, w - 2 * t, h - 2 * t, r - t, COLOR_ON);
+      };
+
+      // ---------------- parse the thread ----------------
+      struct Rec { char who; time_t t; std::string text; };
+      std::vector<Rec> recs;
+      {
+        std::string s = id(thread);
+        size_t pos = 0;
+        while (!s.empty() && pos <= s.size()) {
+          size_t e = s.find('\x1E', pos);
+          if (e == std::string::npos) e = s.size();
+          if (e > pos) {
+            std::string rec = s.substr(pos, e - pos);
+            size_t a = rec.find('\x1F');
+            size_t b = (a == std::string::npos) ? std::string::npos : rec.find('\x1F', a + 1);
+            if (a != std::string::npos && b != std::string::npos) {
+              Rec r;
+              r.who = rec[0];
+              r.t = (time_t) atol(rec.substr(a + 1, b - a - 1).c_str());
+              r.text = rec.substr(b + 1);
+              recs.push_back(r);
+            }
+          }
+          if (e >= s.size()) break;
+          pos = e + 1;
+        }
+      }
+
+      auto now = id(rtc_time).now();
+
+      // =================================================================
+      // IMPACT. A new message takes the whole panel, inverted, until touched.
+      // =================================================================
+      if (!id(msg_seen) && !id(message).empty()) {
+        it.filled_rectangle(0, 0, W, H, COLOR_OFF);
+
+        {
+          // "(muted)" is placed from the name's measured width. At a fixed x a
+          // longer name runs straight into it: at 32px, "Mummy" is 127px and
+          // "Grandma" 143px against the 116px a fixed x=136 allows.
+          //
+          // OFFLINE right-aligns from about x=318, so the name and the flag
+          // together get 290px, or 204px once "(muted)" needs its share.
+          std::string nm = fit("${sender_name}", id(font_medium),
+                               id(sound_on) ? 290 : 204);
+          it.print(20, 18, id(font_medium), COLOR_ON, TextAlign::TOP_LEFT, nm.c_str());
+          if (!id(sound_on))
+            it.print(20 + text_w(nm, id(font_medium)) + 14, 26, id(font_small),
+                     COLOR_ON, TextAlign::TOP_LEFT, "(muted)");
+        }
+        if (id(link_up)) it.filled_circle(396, 32, 6, COLOR_ON);
+        if (!isnan(id(battery_level).state))
+          it.printf(460, 26, id(font_tiny), COLOR_ON, TextAlign::TOP_RIGHT, "%.0f%%",
+                    id(battery_level).state);
+        it.line(0, 64, W, 64, COLOR_ON);
+
+        // The sender's bubble, same form and same place as in the thread,
+        // lifted out of the black. Inter Bold, not comic caps.
+        const int BX = 24, BW = 432, PAD = 32;
+        decltype(id(font_small)) fonts[3] = {id(font_impact), id(font_large), id(font_medium)};
+        const int lh[3] = {68, 58, 40};
+        int pick = 2;
+        std::vector<std::string> lines;
+        for (int i = 0; i < 3; i++) {
+          lines = wrap(id(message), fonts[i], BW - 2 * PAD);
+          pick = i;
+          if ((int) lines.size() * lh[i] <= 300) break;
+        }
+        int bh = (int) lines.size() * lh[pick] + 48;
+        int by = 280 - (bh - 200) / 2;
+        if (by < 120) by = 120;
+
+        rfill(BX, by, BW, bh, 28, COLOR_ON);
+        int ty = by + 24;
+        for (auto &l : lines) {
+          it.print(BX + PAD, ty, fonts[pick], COLOR_OFF, TextAlign::TOP_LEFT, l.c_str());
+          ty += lh[pick];
+        }
+        it.filled_triangle(BX + 18, by + bh - 2, BX + 42, by + bh - 2,
+                           BX + 18, by + bh + 24, COLOR_ON);
+        if (id(msg_time) > 0)
+          it.print(30, by + bh + 34, id(font_tiny), COLOR_ON, TextAlign::TOP_LEFT,
+                   hhmm(ESPTime::from_epoch_local(id(msg_time))).c_str());
+
+        it.line(0, 596, W, 596, COLOR_ON);
+        it.print(W / 2, 636, id(font_medium), COLOR_ON, TextAlign::TOP_CENTER,
+                 "TOUCH TO REPLY");
+
+        std::string st = id(link_up) ? "online" : "OFFLINE";
+        if (id(last_sync) > 0)
+          st += "  ·  synced " + hhmm(ESPTime::from_epoch_local(id(last_sync)));
+        it.print(W / 2, 756, id(font_tiny), COLOR_ON, TextAlign::TOP_CENTER, st.c_str());
+        id(link_shown) = id(link_up);
+        return;
+      }
+
+      // =================================================================
+      // THREAD — the resting state
+      // =================================================================
+      // Muted must be visible. A silent device and a broken device otherwise
+      // look identical from across the room.
+      //
+      // "(muted)" sits after the name so it reads as one phrase, placed from
+      // the name's measured width rather than a fixed x. At 32px a fixed
+      // x=136 gives the name 116px, which "Mummy" (127px) and "Grandma"
+      // (143px) both overrun. OFFLINE right-aligns from about x=318, so the
+      // pair gets 290px, or 204px for the name once "(muted)" needs its share.
+      {
+        std::string nm = fit("${sender_name}", id(font_medium),
+                             id(sound_on) ? 290 : 204);
+        it.print(20, 18, id(font_medium), COLOR_OFF, TextAlign::TOP_LEFT, nm.c_str());
+        if (!id(sound_on))
+          it.print(20 + text_w(nm, id(font_medium)) + 14, 26, id(font_small),
+                   COLOR_OFF, TextAlign::TOP_LEFT, "(muted)");
+      }
+      if (id(link_up)) it.filled_circle(396, 32, 6, COLOR_OFF);
+      else it.print(390, 26, id(font_tiny), COLOR_OFF, TextAlign::TOP_RIGHT, "OFFLINE");
+      if (!isnan(id(battery_level).state))
+        it.printf(460, 26, id(font_tiny), COLOR_OFF, TextAlign::TOP_RIGHT, "%.0f%%",
+                  id(battery_level).state);
+      it.line(0, 64, W, 64, COLOR_OFF);
+      id(link_shown) = id(link_up);
+
+      // A joke wins over everything in this area, the wifi hint included. It
+      // needs no network, so an outage is when it is worth the most. Reversing
+      // this precedence kills jokes for as long as the AP is up.
+      if (id(showing_joke)) {
+        // A pushed bundle wins; the built-in set is the fallback when nothing
+        // has been pushed or the broker has never been reachable.
+        const std::string &src_all =
+            id(jokes).empty() ? id(jokes_builtin) : id(jokes);
+        std::vector<std::string> jokelist;
+        {
+          std::string cur;
+          for (char c : src_all) {
+            if (c == '\n') {
+              if (!cur.empty()) jokelist.push_back(cur);
+              cur.clear();
+            } else if (c != '\r') {
+              cur.push_back(c);
+            }
+          }
+          if (!cur.empty()) jokelist.push_back(cur);
+        }
+
+        // "|" is the line break inside a joke, with any spaces around it eaten
+        // so the break does not become a blank line in wrap().
+        std::string jtext;
+        {
+          const std::string &src = jokelist[id(joke_idx) % jokelist.size()];
+          for (size_t i = 0; i < src.size(); i++) {
+            if (src[i] == '|') {
+              while (!jtext.empty() && jtext.back() == ' ') jtext.pop_back();
+              jtext.push_back('\n');
+              while (i + 1 < src.size() && src[i + 1] == ' ') i++;
+            } else {
+              jtext.push_back(src[i]);
+            }
+          }
+        }
+
+        // Text block runs 84..400, footer sits at 410, separator is at 436.
+        // Six lines at 50 is 300, which still fits; the longest authored joke
+        // wraps to four.
+        auto jl = wrap(jtext, id(font_joke), 440);
+        int jy = 76 + (316 - (int) jl.size() * 50) / 2;
+        if (jy < 84) jy = 84;
+        for (auto &l : jl) {
+          it.print(W / 2, jy, id(font_joke), COLOR_OFF, TextAlign::TOP_CENTER, l.c_str());
+          jy += 50;
+        }
+        // font_small, not font_tiny. font_tiny is unreadable at this size.
+        it.print(W / 2, 410, id(font_small), COLOR_OFF, TextAlign::TOP_CENTER,
+                 "tap up to go back  ·  poo for another");
+      } else if (id(ap_hint)) {
+        // The AP has been up 15 minutes. See the interval for that number.
+        //
+        // Replaces the thread only. The reaction circles and reply pills are
+        // drawn either way, so sounds, jokes and queued replies keep working.
+        // The thread is stale by definition after a quarter hour offline.
+        //
+        // The AP password is not on screen. Anyone joining that
+        // network can rewrite the wifi credentials.
+        it.print(W / 2, 132, id(font_large), COLOR_OFF, TextAlign::TOP_CENTER,
+                 "wifi not found");
+        it.print(W / 2, 216, id(font_small), COLOR_OFF, TextAlign::TOP_CENTER,
+                 "to add another network, connect to");
+        it.print(W / 2, 250, id(font_medium), COLOR_OFF, TextAlign::TOP_CENTER,
+                 "${ap_ssid}");
+        it.print(W / 2, 298, id(font_small), COLOR_OFF, TextAlign::TOP_CENTER,
+                 "on a phone or iPad");
+        it.print(W / 2, 378, id(font_tiny), COLOR_OFF, TextAlign::TOP_CENTER,
+                 "ask ${sender_name} for the password");
+      } else {
+        const int TOP = 76, BOT = 428;
+        int y = BOT;
+        std::vector<int> by_, bh_, bx_, bw_;
+        std::vector<std::vector<std::string>> bl_;
+        std::vector<char> bwho_;
+        std::vector<time_t> bt_;
+        for (int i = (int) recs.size() - 1; i >= 0; i--) {
+          bool mine = recs[i].who == 'K';
+          int bw = mine ? 368 : 404;
+          int bx = mine ? (W - 16 - bw) : 16;
+          auto lines = wrap(recs[i].text, id(font_medium), bw - 48);
+          if (lines.empty()) continue;
+          int bh = (int) lines.size() * 40 + 30;
+          if (y - bh - 30 < TOP) break;
+          y -= bh + 30;
+          by_.push_back(y); bh_.push_back(bh); bx_.push_back(bx); bw_.push_back(bw);
+          bl_.push_back(lines); bwho_.push_back(recs[i].who); bt_.push_back(recs[i].t);
+          y -= 12;
+        }
+        for (int k = (int) by_.size() - 1; k >= 0; k--) {
+          bool mine = bwho_[k] == 'K';
+          int bx = bx_[k], by = by_[k], bw = bw_[k], bh = bh_[k];
+          if (mine) rfill(bx, by, bw, bh, 20, COLOR_OFF);
+          else rring(bx, by, bw, bh, 20, 2, COLOR_OFF);
+          int ty = by + 15;
+          for (auto &l : bl_[k]) {
+            it.print(bx + 24, ty, id(font_medium), mine ? COLOR_ON : COLOR_OFF,
+                     TextAlign::TOP_LEFT, l.c_str());
+            ty += 40;
+          }
+          if (mine) {
+            it.filled_triangle(bx + bw - 42, by + bh - 2, bx + bw - 18, by + bh - 2,
+                               bx + bw - 18, by + bh + 22, COLOR_OFF);
+          } else {
+            // An outlined bubble needs an outlined tail: two strokes at the
+            // bubble's own weight, with its bottom edge erased between them so
+            // the mouth is open. A filled triangle here reads far heavier than
+            // the outline it hangs off.
+            //
+            // x starts at bx+22, not bx+18. The straight bottom run begins at
+            // bx+r with r=20, so a tail rooted left of that hangs off the
+            // corner arc instead of the flat edge.
+            it.line(bx + 24, by + bh - 1, bx + 44, by + bh - 1, COLOR_ON);
+            it.line(bx + 24, by + bh - 2, bx + 44, by + bh - 2, COLOR_ON);
+            it.line(bx + 22, by + bh - 1, bx + 22, by + bh + 22, COLOR_OFF);
+            it.line(bx + 23, by + bh - 1, bx + 23, by + bh + 22, COLOR_OFF);
+            it.line(bx + 22, by + bh + 22, bx + 46, by + bh - 1, COLOR_OFF);
+            it.line(bx + 23, by + bh + 22, bx + 47, by + bh - 1, COLOR_OFF);
+          }
+          // The timestamp sits beside the tail, not under it. Under it the
+          // block needs 41px of clearance below every bubble against the 30px
+          // reserved, and three messages stop fitting.
+          if (bt_[k] > 0) {
+            std::string ts = hhmm(ESPTime::from_epoch_local(bt_[k]));
+            if (mine) {
+              it.print(bx + bw - 66, by + bh + 4, id(font_tiny), COLOR_OFF,
+                       TextAlign::TOP_RIGHT, ts.c_str());
+              // sent tick — two lines, no glyph needed
+              int tx = bx + bw - 62, tyy = by + bh + 6;
+              it.line(tx, tyy + 4, tx + 4, tyy + 8, COLOR_OFF);
+              it.line(tx + 4, tyy + 8, tx + 12, tyy - 2, COLOR_OFF);
+            } else {
+              it.print(bx + 58, by + bh + 4, id(font_tiny), COLOR_OFF,
+                       TextAlign::TOP_LEFT, ts.c_str());
+            }
+          }
+        }
+        if (by_.empty())
+          it.print(W / 2, 250, id(font_small), COLOR_OFF, TextAlign::TOP_CENTER,
+                   "no messages yet");
+      }
+
+      // Anything still queued says so. A tap does not vanish silently.
+      if (!id(pending_reply).empty())
+        // "waiting to send", not "waiting for wifi". What is down in this
+        // state is the broker link. Wifi is usually fine.
+        it.print(16, 438, id(font_tiny), COLOR_OFF, TextAlign::TOP_LEFT,
+                 fit("waiting to send: " + id(pending_reply), id(font_tiny), 448).c_str());
+
+      // ---------------- reactions ----------------
+      it.line(0, 436, W, 436, COLOR_OFF);
+      {
+        const char *emo[4] = {"\xF0\x9F\x92\xA8", "\xF0\x9F\x92\xA9",
+                              "\xF0\x9F\x98\x82", "\xE2\x9D\xA4"};
+        for (int i = 0; i < 4; i++) {
+          int cx = 60 + i * 120;
+          it.filled_circle(cx, 496, 30, COLOR_OFF);
+          it.filled_circle(cx, 496, 28, COLOR_ON);
+          it.print(cx, 480, id(font_medium), COLOR_OFF, TextAlign::TOP_CENTER, emo[i]);
+        }
+      }
+
+      // ---------------- quick replies ----------------
+      {
+        // 80px is about 9mm at this panel's 235 ppi, a small fingertip. The
+        // touch bands in binary_sensor are taller again and tile edge to edge,
+        // so the gaps between pills are live rather than dead.
+        std::string lbl[3] = {id(reply1), id(reply2), id(reply3)};
+        const int py[3] = {538, 624, 710};
+        for (int i = 0; i < 3; i++) {
+          if (lbl[i].empty()) continue;
+          // Largest size that fits the whole label, per label.
+          //
+          // No truncation. The full text is what gets published to from_kid,
+          // so a cut label would send words the user did not see.
+          //
+          // Two steps only, 32 then 20. Below 20 it stops being legible across
+          // a room. Beanstalk caps label length so that floor is not reached.
+          rring(16, py[i], 448, 80, 40, 2, COLOR_OFF);
+          bool big = text_w(lbl[i], id(font_medium)) <= 400;
+          it.print(W / 2, py[i] + (big ? 22 : 27),
+                   big ? id(font_medium) : id(font_small),
+                   COLOR_OFF, TextAlign::TOP_CENTER,
+                   fit(lbl[i], big ? id(font_medium) : id(font_small), 400).c_str());
+        }
+      }
+
+
+# =============================================================================
+# Network
+# =============================================================================
+
+wifi:
+  # 0s disables the reboot after 15 minutes without wifi. That reboot restarts
+  # the device out from under whoever is typing credentials into the captive
+  # portal.
+  reboot_timeout: 0s
+  networks:
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
+    # Optional second network, so the panel connects in two places. Both
+    # parts are secrets so the config does not name a network you do not own.
+    #
+    # Always referenced, so secrets.yaml must always define both keys. An SSID
+    # that does not exist is not found, so the placeholder is safe to leave
+    # in place.
+    - ssid: !secret wifi_ssid_alt
+      password: !secret wifi_password_alt
+  ap:
+    ssid: "${ap_ssid}"
+    password: !secret ap_password
+    # ap_timeout belongs HERE, under ap:, not under wifi:. Under wifi: it is
+    # rejected with "did you mean reboot_timeout", which reads like the option
+    # does not exist.
+    #
+    # Default 90s. 30s because this is the only recovery path once the device
+    # is away, and 90 seconds of blank screen looks like a failure.
+    ap_timeout: 30s
+
+captive_portal:
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+# =============================================================================
+# MQTT
+#
+# birth_message and will_message must be PRESENT WITH EMPTY VALUES. Commenting
+# them out reverts to the default on <topic_prefix>/status, which the broker
+# denies publish on, which fails the whole CONNECT as 0x5 Not Authorized.
+# =============================================================================
+
+mqtt:
+  id: mqtt_client
+  broker: !secret mqtt_broker
+  port: 8883
+  username: !secret mqtt_username
+  password: !secret mqtt_password
+  client_id: sticky1234
+  discovery: false
+  topic_prefix: sticky
+  # WARN, not DEBUG. At DEBUG every touch, redraw and script warning is
+  # republished over TLS. Monthly volume looks fine; the burst while someone
+  # hammers a button is what evicts other clients from the broker.
+  log_topic:
+    topic: sticky/debug
+    level: WARN
+  idf_send_async: true
+  birth_message:
+
+  will_message:
+
+  certificate_authority: |
+    -----BEGIN CERTIFICATE-----
+    MIIF9DCCA9ygAwIBAgIRAPJLbRf52a18scn+p4eCaZ8wDQYJKoZIhvcNAQELBQAw
+    TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
+    cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMjYwNTEzMDAwMDAw
+    WhcNMzIwOTAyMjM1OTU5WjAuMQswCQYDVQQGEwJVUzENMAsGA1UEChMESVNSRzEQ
+    MA4GA1UEAxMHUm9vdCBZUjCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIB
+    ANvGJnN78CTJdWL3+eGfsLN5TrNBJs+VH9hRXqRbwxu9sGNiB0BD1fcOxbSUQCJI
+    M1xE13Db+5Cw1w0s0EBYsvuIP/6joF0w8cuImbgR1OGgYbSQ4OpzI+DG8SGuTlcE
+    873OCS+kh3srlo6vl43M5OJg4Aeo1sfHp6kTJDoIiFBNJAY+OKfX/FUvYKuhjT+n
+    o49lmqmupSBI5PkBQiqrEGtWU5uxU/cQWHGu8jSjFBznZqvbNPLMXMLFxCb3WTfr
+    JBXXjqvWG+v4bjzxjjeAtOlU7qarRDvNOyAuQYLln904M+faKx8hnLCpJ15ZqaEg
+    cNlY+9MMWcC5yvL2A2j3l9+2buggZX+dOE91zYmIdawTvSZuVvlbRrAlLxIB6pwM
+    BjneXCjYQ8+3BCCjssbSNpZU3hTcBDdhfAlEDlYr6pEatnMdmDT5BqnKC92bd0Eh
+    M1fbLHioLccLCuievT8ZkPhZrq7Mii7gNXAcUEAR8+lzYal+9zTg7C5DALyVOeG/
+    CqfRAMn1KSHCR0NSA6P8tn/mGRlnCct5rtVCLnVySVpU6H1qGg3DgTOuskf8eahT
+    MiYbI5ezPJmO5ertalskQ1utp74+eDy92PI4ftHKTbq9IWhH4YZKh3WnJEIt+oQv
+    lYZbY8tpEroKrFB6PFGzrJIDRyts4HqvuH52RFj2zv/BAgMBAAGjgeswgegwDgYD
+    VR0PAQH/BAQDAgEGMBMGA1UdJQQMMAoGCCsGAQUFBwMBMA8GA1UdEwEB/wQFMAMB
+    Af8wHQYDVR0OBBYEFN7nW2DQIm1AKH0/DQH+pLVStFGUMB8GA1UdIwQYMBaAFHm0
+    WeZ7tuXkAXOACIjIGlj26ZtuMDIGCCsGAQUFBwEBBCYwJDAiBggrBgEFBQcwAoYW
+    aHR0cDovL3gxLmkubGVuY3Iub3JnLzATBgNVHSAEDDAKMAgGBmeBDAECATAnBgNV
+    HR8EIDAeMBygGqAYhhZodHRwOi8veDEuYy5sZW5jci5vcmcvMA0GCSqGSIb3DQEB
+    CwUAA4ICAQA8spSI95KKfn2W6GMmDpHBJSPaLbsS3W93cijJCRCYAc1fsJgL1FIL
+    7C0C9ecPOdcwB2fi0Dk2p94j9iTJCxmt5CFSKLRWwnXT2MMSXexVxqoVB79BdWPx
+    VXETkVme/qYSAuKVHh5Ps+5BixgmwS1JkjSAc+MfrUbNssVEEnH0aEiAh+rotXAV
+    JSP/Ye7LJPEwD9DWG72vVWbhAcuOf5OLjz57Ctk7MgQHynZ7+PlHJtajroCaIbtC
+    r6tcZZaAwUQm+jQyeWdV+2hv9deOYFmKeQyjjcSrN5Nadrw+L9DZJLbA1HqeNvLh
+    BgqpP0fvJq2N6EtD574N6eMI7uMsJTnji2UDz9el5XLSv9fqJMuDQtYVb2oTNoKp
+    oUqhxPVC0aq4eG5MESaIdn8b5ZGSSeAJLMHXljEdlNza+ncfkviXk1POLnnFdvx8
+    /gk6M374WbLWFXw8N141B/Rl/tINGfl1TxOIiqtiMYkL02RSGb1kq34BL9NPP27z
+    RGMuHGnzS3hFIrRTfKxrzUZ9RzQWzEG3K6fJ3r2nqSltkeytis9DIBoFY9VmVyjL
+    M71DMi+y1+TRSJVClEMwvA4yL++7q9XZx5r5wBRWB4kQTKH5qyoZnDw7iiuh1lID
+    yDFx8r7i9vIJU5HS3moZLkYWAOilMaV9N56A9Bgb6dNcHkvg3NoaYA==
+    -----END CERTIFICATE-----
+  on_connect:
+    - script.stop: show_offline
+    - lambda: |-
+        id(link_up) = true;
+        id(mqtt_up_at) = millis();
+        if (id(rtc_time).now().is_valid()) {
+          id(last_sync) = id(rtc_time).now().timestamp;
+        }
+    # NOT publish_buttons here. A publish issued from inside on_connect looks
+    # like it succeeded and never reaches the broker. Flag it and let the 15s
+    # interval publish.
+    - lambda: 'id(buttons_dirty) = true;'
+    - script.execute: redraw
+  on_disconnect:
+    - lambda: 'id(link_up) = false;'
+    - script.execute: show_offline
+
+# =============================================================================
+# Inbound
+#
+# Payload is plaintext. A line beginning with "?" sets the three reply buttons
+# and is not displayed:
+#
+#     Homework done? Dinner at 6.
+#     ?yes, no, not yet
+#
+# The buttons stay set until changed. A bare "?" resets them. "?a, b, c" alone
+# sets them without posting a message. Fewer than three options leaves the
+# extras undrawn and inert.
+# =============================================================================
+
+text_sensor:
+  # Joke bundles from Beanstalk. Retained, so this fires a few seconds after
+  # every connect as well as on every change.
+  #
+  # A content update, not a message: no beep, and no redraw unless a joke is
+  # currently on screen.
+  - platform: mqtt_subscribe
+    id: incoming_jokes
+    internal: true
+    topic: sticky/jokes
+    qos: 1
+    on_value:
+      then:
+        - lambda: |-
+            std::string v = x;
+            if (v == id(jokes)) return;      // retained replay of what we have
+            id(jokes) = v;
+            id(joke_idx) = 0;
+            ESP_LOGW("jokes", "bundle loaded, %d bytes", (int) v.size());
+        - script.execute: publish_jokes_active
+        - if:
+            condition:
+              lambda: 'return id(showing_joke);'
+            then:
+              - script.execute: redraw
+
+  # No name and no state topic. A named text_sensor is republished by ESPHome
+  # to sticky/text_sensor/incoming/state, retained, which would leave the last
+  # message sitting on the broker indefinitely. The panel keeps it in flash;
+  # the broker does not need a copy.
+  - platform: mqtt_subscribe
+    id: incoming
+    internal: true
+    retain: false
+    topic: sticky/to_kid
+    qos: 1
+    on_value:
+      then:
+        - lambda: |-
+            std::string s = x;
+
+            // A retained message on sticky/to_kid is replayed on every
+            // subscribe. Without this guard the replay re-flags the old
+            // message as unread and beeps, on every reboot.
+            //
+            // Narrow: only a message byte-identical to the one on
+            // screen AND arriving within 15s of connecting, which is when a
+            // retained replay lands. Sending the same text on two different
+            // days is unaffected.
+            id(ignore_incoming) = false;
+
+            auto trim = [](std::string v) -> std::string {
+              size_t a = v.find_first_not_of(" \t\r\n");
+              if (a == std::string::npos) return std::string("");
+              size_t b = v.find_last_not_of(" \t\r\n");
+              return v.substr(a, b - a + 1);
+            };
+
+            std::string spec;
+            size_t p = std::string::npos;
+            if (!s.empty() && s[0] == '?') {
+              p = 0;
+            } else {
+              size_t q = s.rfind("\n?");
+              if (q != std::string::npos) p = q + 1;
+            }
+            if (p != std::string::npos) {
+              spec = s.substr(p + 1);
+              s = s.substr(0, p);
+            }
+            s = trim(s);
+
+            // Must sit BEFORE the button parsing, or a suppressed replay would
+            // already have rewritten the labels.
+            if (!s.empty() && s == id(message) &&
+                (uint32_t)(millis() - id(mqtt_up_at)) < 15000) {
+              id(ignore_incoming) = true;
+              return;
+            }
+
+            id(buttons_only) = false;
+            bool had_spec = (p != std::string::npos);
+            std::string spec_t = trim(spec);
+
+            // The triad belongs to the DEVICE, not to each message. An
+            // ordinary message leaves the buttons alone; only a "?" changes
+            // them, and a bare "?" resets.
+            //
+            // Separator is a comma or a pipe. Comma matters because "|" is two
+            // taps into a symbol menu on a phone.
+            if (had_spec) {
+              if (spec_t.empty()) {
+                // A bare "?" is the explicit reset. These three strings and the
+                // reply1/2/3 initial_values must change together.
+                id(reply1) = "miss you";
+                id(reply2) = "call me";
+                id(reply3) = "goodnight";
+              } else {
+                std::string parts[3];
+                int n = 0;
+                std::string cur;
+                for (char c : spec_t) {
+                  if (c == '|' || c == ',') {
+                    if (n < 3) parts[n++] = trim(cur);
+                    cur.clear();
+                  } else if (c != '\n' && c != '\r') {
+                    cur.push_back(c);
+                  }
+                }
+                if (n < 3) parts[n++] = trim(cur);
+                id(reply1) = parts[0];
+                id(reply2) = parts[1];
+                id(reply3) = parts[2];
+                if (id(reply1).empty() && id(reply2).empty() && id(reply3).empty()) {
+                  id(reply1) = "miss you";
+                  id(reply2) = "call me";
+                  id(reply3) = "goodnight";
+                }
+              }
+            }
+
+            // "?a,b,c" with nothing else is a command, not a message. Set the
+            // labels, redraw, stop. No beep, no impact screen, no empty bubble.
+            // One line, no shift-enter, so it can be typed on a phone.
+            if (had_spec && s.empty()) {
+              id(buttons_only) = true;
+              return;
+            }
+
+            id(incoming_text) = s;
+            id(message) = s;
+            id(msg_seen) = false;
+            id(showing_joke) = false;
+            id(ack_text) = "";
+            id(ack_time) = 0;
+            id(msg_time) = id(rtc_time).now().is_valid() ? id(rtc_time).now().timestamp : 0;
+            if (id(msg_time) > 0) id(last_sync) = id(msg_time);
+        - if:
+            condition:
+              lambda: 'return !id(ignore_incoming);'
+            then:
+              - if:
+                  condition:
+                    lambda: 'return !id(buttons_only);'
+                  then:
+                    - script.execute:
+                        id: thread_add
+                        who: !lambda 'return "M";'
+                        text: !lambda 'return id(incoming_text);'
+                    # Two short beeps for inbound, so it does not sound like a
+                    # reply going out
+                    - light.turn_on:
+                        id: buzzer
+                        brightness: !lambda 'return id(sound_on) ? 0.60f : 0.0f;'
+                    - delay: 120ms
+                    - light.turn_off: buzzer
+                    - delay: 100ms
+                    - light.turn_on:
+                        id: buzzer
+                        brightness: !lambda 'return id(sound_on) ? 0.60f : 0.0f;'
+                    - delay: 120ms
+                    - light.turn_off: buzzer
+              - script.execute: publish_buttons
+              - script.execute: redraw
+
+# =============================================================================
+# Deep sleep is off. To enable it, uncomment this block AND set
+# allow_other_uses: true on the GPIO4 binary_sensor above. The two changes
+# travel together.
+#
+# Note: the 15min interval redraw above does not fire during sleep. That is
+# fine; the device redraws on wake.
+# =============================================================================
+# deep_sleep:
+#   id: deep_sleep_1
+#   run_duration: 30s
+#   sleep_duration: 15min
+#   esp32_ext1_wakeup:
+#     pins:
+#       - number: GPIO4
+#         mode: INPUT_PULLUP
+#         allow_other_uses: true
+#     mode: ANY_LOW
+
+# See secrets.yaml.example for the keys this file expects.

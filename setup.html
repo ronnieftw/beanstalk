@@ -1,0 +1,497 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Beanstalk setup</title>
+<style>
+/* Spec sheet. Monospace, hairlines, no radius anywhere. Nothing is decorated;
+   structure comes from rules and alignment. */
+:root{color-scheme:light dark;--paper:#fcfcfa;--ink:#161613;--dim:#6f6f68;
+  --rule:#c9c9c2;--fill:#f0f0ea}
+@media (prefers-color-scheme:dark){:root{--paper:#101010;--ink:#e6e6e0;
+  --dim:#8f8f88;--rule:#333330;--fill:#1b1b19}}
+*{box-sizing:border-box}
+body{margin:0;padding:40px 20px 90px;background:var(--paper);color:var(--ink);
+  font:14px/1.6 ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace}
+main{max-width:640px;margin:0 auto}
+.top{display:flex;align-items:baseline;justify-content:space-between;
+  padding-bottom:10px;border-bottom:1px solid var(--ink)}
+h1{font-size:20px;font-weight:700;letter-spacing:.02em;margin:0;text-transform:uppercase}
+.top .stamp{font-size:11px;color:var(--dim);letter-spacing:.14em}
+.lede{margin:16px 0 20px;color:var(--dim);max-width:64ch}
+h2{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.18em;
+  margin:44px 0 4px;padding-bottom:6px;border-bottom:1px solid var(--rule)}
+h2::before{content:"// "}
+.f{margin:0 0 16px}
+label{display:block;font-weight:700;font-size:13px;margin:14px 0 2px}
+label::after{content:" ="}
+.help{color:var(--dim);font-size:12.5px;margin:0 0 6px;max-width:66ch}
+.help::before{content:"# ";color:var(--rule)}
+input{width:100%;padding:9px 11px;font:inherit;color:var(--ink);
+  background:var(--fill);border:1px solid var(--rule);border-radius:0}
+input::placeholder{color:var(--dim)}
+input:focus{outline:none;border-color:var(--ink);background:var(--paper)}
+.row{display:flex;gap:0}
+.row input{flex:1;min-width:0;border-right:0}
+button{padding:9px 16px;font:inherit;font-weight:700;font-size:12px;
+  text-transform:uppercase;letter-spacing:.1em;color:var(--ink);
+  background:var(--fill);border:1px solid var(--rule);border-radius:0;
+  cursor:pointer;white-space:nowrap}
+button:hover{background:var(--ink);color:var(--paper);border-color:var(--ink)}
+button.go{background:var(--ink);color:var(--paper);border-color:var(--ink);
+  padding:11px 20px;font-size:13px}
+button.go:hover{opacity:.82}
+button.go:disabled{background:transparent;color:var(--dim);
+  border-color:var(--rule);cursor:not-allowed}
+.note{border:0;border-left:2px solid var(--rule);padding:2px 0 2px 14px;
+  margin:0 0 20px;color:var(--dim);font-size:13px}
+.note code{color:var(--ink)}
+.note em{font-style:normal;font-weight:700;color:var(--ink)}
+ul.box{list-style:none;border:0;border-left:2px solid var(--ink);
+  background:var(--fill);padding:12px 14px;margin:22px 0}
+ul.box li{padding-left:18px;text-indent:-18px}
+ul.box li::before{content:"!  ";font-weight:700}
+ul.box li+li{margin-top:8px}
+ul.box.w{border-left-style:dashed;background:transparent;color:var(--dim)}
+ul.box.w li::before{content:"?  "}
+pre{background:var(--fill);border:1px solid var(--rule);border-radius:0;
+  padding:14px;overflow-x:auto;font-size:12.5px;line-height:1.65}
+code{font-size:1em}
+.dl{display:flex;gap:10px;flex-wrap:wrap;margin:20px 0 0}
+.done{font-size:12.5px;margin:12px 0 0}
+.done::before{content:"ok\00a0\00a0"}
+.msg{font-size:12.5px;margin:6px 0 0}
+footer{margin-top:50px;padding-top:14px;border-top:1px solid var(--rule);
+  color:var(--dim);font-size:12.5px}
+</style>
+</head>
+<body>
+<main>
+
+<div class="top">
+  <h1>Beanstalk</h1>
+  <span class="stamp">SETUP · ONCE</span>
+</div>
+
+<p class="lede">This writes the two files that hold your settings:
+<code>secrets.yaml</code> for the panel, <code>beanstalk.env</code> for the
+bridge.</p>
+
+<p class="note">This page runs entirely in your browser. Nothing is sent
+anywhere, and it works with the network off. Open the file in a text editor if
+you would rather check that yourself.</p>
+
+<form id="form" autocomplete="off">
+
+<h2>The panel</h2>
+
+<div class="f">
+  <label for="sender_name">Sender name</label>
+  <p class="help">Shown at the top of the panel, and in the setup instructions
+  the panel displays if it loses wifi. Whatever they call you.</p>
+  <input id="sender_name" value="Mama">
+</div>
+
+<div class="f">
+  <label for="wifi_ssid">Your wifi network</label>
+  <p class="help">Where you set the panel up and flash it.</p>
+  <input id="wifi_ssid">
+</div>
+
+<div class="f">
+  <label for="wifi_password">Your wifi password</label>
+  <input id="wifi_password" type="password">
+</div>
+
+<div class="f">
+  <label for="wifi_ssid_alt">Second wifi network</label>
+  <p class="help">A second wifi SSID if needed. Leave blank if not.</p>
+  <input id="wifi_ssid_alt">
+</div>
+
+<div class="f">
+  <label for="wifi_password_alt">Second wifi password</label>
+  <input id="wifi_password_alt" type="password">
+</div>
+
+<div class="f">
+  <label for="ap_password">Setup network password</label>
+  <p class="help">When the panel can find no known wifi it raises its own
+  network, so whoever is with it can put it back on wifi from a phone. You will
+  be reading this out over the phone, so keep it short and speakable.</p>
+  <div class="row">
+    <input id="ap_password">
+    <button type="button" onclick="suggestWords()">Suggest</button>
+  </div>
+</div>
+
+<div class="f">
+  <label for="ota_password">Update password</label>
+  <p class="help">Guards firmware updates sent over wifi. Never typed by
+  hand.</p>
+  <div class="row">
+    <input id="ota_password">
+    <button type="button" onclick="gen('ota_password')">Generate</button>
+  </div>
+</div>
+
+<h2>The broker</h2>
+
+<p class="note">Both ends dial out to a hosted MQTT broker, so neither your
+network nor the panel's has to accept incoming connections. HiveMQ Cloud's free
+tier is enough. Make two credentials, one for each end, so either password can
+be changed later without taking both ends down.</p>
+
+<p class="note">Give both credentials publish <em>and</em> subscribe. On
+HiveMQ's free tier that is a per-credential setting.</p>
+
+<div class="f">
+  <label for="mqtt_broker">Hostname</label>
+  <p class="help">Bare hostname. Do not include https:// or a port.</p>
+  <input id="mqtt_broker" placeholder="abcdef123.s1.eu.hivemq.cloud">
+</div>
+
+<div class="f">
+  <label for="mqtt_port">Port</label>
+  <input id="mqtt_port" value="8883">
+</div>
+
+<div class="f">
+  <label for="mqtt_username">Panel username</label>
+  <input id="mqtt_username" value="sticky">
+</div>
+
+<div class="f">
+  <label for="mqtt_password">Panel password</label>
+  <input id="mqtt_password" type="password">
+</div>
+
+<div class="f">
+  <label for="bridge_mqtt_username">Bridge username</label>
+  <input id="bridge_mqtt_username" value="bridge">
+</div>
+
+<div class="f">
+  <label for="bridge_mqtt_password">Bridge password</label>
+  <input id="bridge_mqtt_password" type="password">
+</div>
+
+<h2>Telegram</h2>
+
+<p class="note">Install the Telegram app and make an account if you do not have
+one. Everything you send to the panel goes through a bot you own, inside
+Telegram.</p>
+
+<div class="f">
+  <label for="telegram_token">Bot token</label>
+  <p class="help">In Telegram, message <code>@BotFather</code> and send
+  <code>/newbot</code>. It asks for a name and a username, then sends a long
+  reply. The token is the one line in it that looks like
+  <code>8123456789:AAHk3x...</code> — paste the whole token string, including
+  the digits before the colon.</p>
+  <input id="telegram_token" placeholder="8123456789:AAHk3xamPLEt0kenDoNotUse">
+</div>
+
+<div class="f">
+  <label for="telegram_chat_id">Your chat id</label>
+  <p class="help">Leave this blank. On first run the bridge prints a pairing
+  code, and the chat that sends it is the only chat the bridge answers. Fill
+  it in only if you already know the number.</p>
+  <input id="telegram_chat_id" placeholder="paired on first run">
+</div>
+
+<h2>The bridge</h2>
+
+<div class="f">
+  <label for="pi_host">User and hostname for the Raspberry Pi</label>
+  <p class="help">Whatever you type after <code>ssh</code>. Nothing
+  connects from here; it only fills in the commands at the bottom of this
+  page.</p>
+  <input id="pi_host" placeholder="user@hostname">
+</div>
+
+<div class="f">
+  <label for="bridge_mqtt_client_id">Bridge client id</label>
+  <p class="help">Must differ from the panel's, which is
+  <code>sticky1234</code>. Two MQTT clients sharing an id knock each other
+  offline continuously.</p>
+  <input id="bridge_mqtt_client_id" value="beanstalk">
+</div>
+
+<div class="f">
+  <label for="topic_prefix">Topic prefix</label>
+  <input id="topic_prefix" value="sticky">
+</div>
+
+<div class="f">
+  <label for="silent_minutes">Alert after silence (minutes)</label>
+  <p class="help">The panel reports in every five minutes. Silence past this
+  means it is off, flat, or off wifi.</p>
+  <input id="silent_minutes" value="20">
+</div>
+
+<div class="f">
+  <label for="low_battery">Alert below battery (%)</label>
+  <input id="low_battery" value="15">
+</div>
+
+</form>
+
+<div id="problems"></div>
+
+<h2>Files</h2>
+<div class="dl">
+  <button class="go" id="b1" onclick="dl('secrets')">Download secrets.yaml</button>
+  <button class="go" id="b2" onclick="dl('env')">Download beanstalk.env</button>
+</div>
+<p class="done" id="dlmsg"></p>
+
+<div id="next"></div>
+
+<footer>Both files hold real credentials. They are listed in
+<code>.gitignore</code>. Do not commit them.</footer>
+
+</main>
+
+<script>
+"use strict";
+
+const KEYS = ["sender_name","wifi_ssid","wifi_password","wifi_ssid_alt",
+ "wifi_password_alt","ap_password","ota_password","mqtt_broker","mqtt_port",
+ "mqtt_username","mqtt_password","bridge_mqtt_username","bridge_mqtt_password",
+ "telegram_token","telegram_chat_id","pi_host","bridge_mqtt_client_id",
+ "topic_prefix","silent_minutes","low_battery"];
+
+const DEVICE_CLIENT_ID = "sticky1234";
+
+const WORDS = ("anchor badger bamboo banjo basil beacon bison cactus canyon "+
+ "cedar cherry cobalt comet copper coral cricket crimson daisy delta domino "+
+ "ember falcon fennel ferry fossil garnet ginger granite harbor hazel indigo "+
+ "ivory jasmine juniper kelp lantern lemon lichen lupin magnet mango maple "+
+ "marble meadow mesa mint moss nectar nutmeg olive onyx opal orbit otter "+
+ "paprika pebble pepper pewter pollen poppy quartz quince radish raven ribbon "+
+ "rosemary saffron sage salmon sandal sesame shale silver sorrel spruce sumac "+
+ "tamarind teak thistle thyme topaz tulip umber vanilla velvet walnut willow "+
+ "yarrow zinnia").split(" ");
+
+const $ = id => document.getElementById(id);
+const val = id => ($(id).value || "").trim();
+
+function rand(n){
+  const a = new Uint8Array(n);
+  crypto.getRandomValues(a);
+  return a;
+}
+function hex(n){
+  return Array.from(rand(n)).map(b=>b.toString(16).padStart(2,"0")).join("");
+}
+function b64(n){
+  return btoa(String.fromCharCode(...rand(n)));
+}
+function pick(arr){
+  return arr[rand(1)[0] % arr.length];
+}
+
+function gen(id){ $(id).value = hex(16); check(); }
+function suggestWords(){
+  let a = pick(WORDS), b = pick(WORDS);
+  while (b === a) b = pick(WORDS);
+  $("ap_password").value = a + "-" + b;
+  check();
+}
+
+// ------------------------------------------------------------------ checks
+
+function problems(){
+  const e = [], w = [];
+  const need = {sender_name:"Sender name", wifi_ssid:"Your wifi network",
+    ap_password:"Setup network password", ota_password:"Update password",
+    mqtt_broker:"Broker hostname", mqtt_username:"Panel username",
+    mqtt_password:"Panel password", bridge_mqtt_username:"Bridge username",
+    bridge_mqtt_password:"Bridge password", telegram_token:"Bot token",
+    bridge_mqtt_client_id:"Bridge client id", topic_prefix:"Topic prefix",
+    pi_host:"User and hostname for the Raspberry Pi"};
+  for (const k in need) if (!val(k)) e.push(need[k] + " is required.");
+
+  if (val("wifi_ssid_alt") && !val("wifi_password_alt"))
+    e.push("The second wifi network has a name but no password.");
+
+  const ap = val("ap_password");
+  if (ap && ap.length < 8)
+    e.push("The setup network password must be at least 8 characters. "+
+           "That is a wifi rule, not ours.");
+  else if (ap.length > 20)
+    w.push("The setup network password is long. It gets read aloud over the "+
+           "phone to whoever is standing next to the panel.");
+
+  const host = val("mqtt_broker");
+  if (host.includes("://"))
+    e.push("The broker hostname takes no https:// or mqtts:// prefix.");
+  else if (host.includes(":"))
+    e.push("The broker hostname takes no port. The port is its own field.");
+  else if (host.endsWith("/"))
+    e.push("The broker hostname takes no trailing slash.");
+
+  if (val("mqtt_username") && val("mqtt_username") === val("bridge_mqtt_username"))
+    w.push("The panel and the bridge are sharing one broker credential. Two "+
+           "would let you change either password without taking both ends down.");
+
+  if (val("bridge_mqtt_client_id") === DEVICE_CLIENT_ID)
+    e.push("The bridge client id cannot be " + DEVICE_CLIENT_ID + ". That is "+
+           "the panel's. Two MQTT clients sharing an id knock each other "+
+           "offline continuously.");
+
+  const tok = val("telegram_token"), chat = val("telegram_chat_id");
+  if (tok && !/^\d{6,}:[A-Za-z0-9_-]{30,}$/.test(tok))
+    e.push("That is not the shape of a bot token. BotFather gives you digits, "+
+           "a colon, then a long string.");
+  else if (tok && chat && tok.split(":")[0] === chat)
+    e.push("The chat id and the digits in the token are the same number. "+
+           "Those digits are the BOT's id. Leave the chat id blank and let the "+
+           "bridge pair itself.");
+  if (chat && !/^-?\d+$/.test(chat))
+    e.push("The chat id is digits only, optionally with a leading minus.");
+
+  for (const [k,label] of [["mqtt_port","Broker port"],
+                           ["silent_minutes","Silence alert"],
+                           ["low_battery","Low battery alert"]])
+    if (!/^\d+$/.test(val(k))) e.push(label + " must be a number.");
+
+  return {e, w};
+}
+
+function check(){
+  const {e, w} = problems();
+  let html = "";
+  if (e.length) html += "<ul class='box'>" + e.map(x=>"<li>"+esc(x)+"</li>").join("") + "</ul>";
+  if (w.length) html += "<ul class='box w'>" + w.map(x=>"<li>"+esc(x)+"</li>").join("") + "</ul>";
+  $("problems").innerHTML = html;
+  $("b1").disabled = $("b2").disabled = e.length > 0;
+  return e.length === 0;
+}
+
+function esc(s){
+  return s.replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]));
+}
+
+// ------------------------------------------------------------------ output
+
+function q(s){ return '"' + String(s).replace(/\\/g,"\\\\").replace(/"/g,'\\"') + '"'; }
+
+function secretsYaml(){
+  return `# Written by setup.html. Never commit this file.
+#
+# ESPHome hard-fails on a missing !secret key, so every entry here must exist
+# even if the feature is unused.
+
+# The name shown at the top of the panel.
+sender_name: ${q(val("sender_name"))}
+
+# Your own network. Where you flash the panel, and where it sits when it is
+# back with you.
+wifi_ssid: ${q(val("wifi_ssid"))}
+wifi_password: ${q($("wifi_password").value)}
+
+# Second network [optional]. sticky.yaml always references both keys, so both
+# are always written. A placeholder SSID is not found.
+wifi_ssid_alt: ${q(val("wifi_ssid_alt") || "...")}
+wifi_password_alt: ${q(val("wifi_ssid_alt") ? $("wifi_password_alt").value : "...")}
+
+# The panel raises its own network under this password when it can find no
+# known wifi. Keep it short and speakable: you will be reading it out over the
+# phone to whoever is with the panel. It also prints in plaintext in the serial
+# log, so it is not a secret in any strong sense.
+ap_password: ${q(val("ap_password"))}
+
+# Guards firmware updates sent over wifi.
+ota_password: ${q(val("ota_password"))}
+
+# The panel's own broker credential. The bridge uses a different one.
+mqtt_broker: ${q(val("mqtt_broker"))}
+mqtt_username: ${q(val("mqtt_username"))}
+mqtt_password: ${q($("mqtt_password").value)}
+
+# Unused. There is no api: block: api: and mqtt: together reboot the panel
+# every 15 minutes when no API client connects. Generated anyway: removing a
+# !secret key that nothing references is harmless, removing one that something
+# does is a hard failure.
+api_encryption_key: ${q(b64(32))}
+`;
+}
+
+function envFile(){
+  const chat = val("telegram_chat_id");
+  return `# /etc/beanstalk.env — written by setup.html. Never commit this file.
+
+# The whole string from BotFather, including the digits before the colon.
+TELEGRAM_TOKEN=${val("telegram_token")}
+
+# Blank means the bridge pairs on first run: it prints a code, and the chat
+# that sends it is the only chat the bridge answers.
+TELEGRAM_CHAT_ID=${chat}
+
+# The bridge's own broker credential, separate from the panel's.
+MQTT_HOST=${val("mqtt_broker")}
+MQTT_PORT=${val("mqtt_port")}
+MQTT_USER=${$("bridge_mqtt_username").value}
+MQTT_PASS=${$("bridge_mqtt_password").value}
+
+# Must differ from the panel's client id (${DEVICE_CLIENT_ID}).
+MQTT_CLIENT_ID=${val("bridge_mqtt_client_id")}
+
+TOPIC_PREFIX=${val("topic_prefix")}
+
+# The panel reports in every 300s, so silence past this means it is off, flat,
+# or off wifi.
+DEVICE_SILENT_MINUTES=${val("silent_minutes")}
+LOW_BATTERY_PCT=${val("low_battery")}
+`;
+}
+
+let got = {};
+
+function dl(which){
+  if (!check()) return;
+  const [name, text] = which === "secrets"
+    ? ["secrets.yaml", secretsYaml()]
+    : ["beanstalk.env", envFile()];
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([text], {type:"text/plain"}));
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(()=>URL.revokeObjectURL(a.href), 4000);
+  got[which] = true;
+  $("dlmsg").textContent = Object.keys(got).length === 2
+    ? "both files downloaded."
+    : name + " downloaded.";
+  if (Object.keys(got).length === 2) showNext();
+}
+
+function showNext(){
+  const pi = esc(val("pi_host"));
+  $("next").innerHTML = `
+<h2>What to do with them</h2>
+<p>Move <code>secrets.yaml</code> out of your Downloads folder and into the
+repo root. If you have not already, copy <code>sticky.yaml.example</code> to
+<code>sticky.yaml</code> beside it — Device Builder only sees the copy. Then
+flash from ESPHome Device Builder.</p>
+<p>For the bridge, from the repo:</p>
+<pre>scp ~/Downloads/beanstalk.env bridge/beanstalk.py bridge/beanstalk.service \\
+    bridge/install-beanstalk ${pi}:~/
+ssh ${pi} './install-beanstalk'</pre>
+<p>The install script prints a pairing code. Send that code to your bot in
+Telegram and the bridge binds to your chat. Nothing else will ever be
+answered.</p>`;
+  $("next").scrollIntoView({behavior:"smooth", block:"start"});
+}
+
+// ------------------------------------------------------------------- init
+
+KEYS.forEach(k => $(k).addEventListener("input", check));
+check();
+</script>
+</body>
+</html>
