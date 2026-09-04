@@ -93,7 +93,9 @@ Tapping the screen then shows the thread view and sends the (message read) recei
 
 Editing a message in Telegram sends the corrected text to the panel again.
 
-Only the twenty emoji built into the firmware will render correctly. Others will show as an empty box.
+Only the twenty emoji built into the firmware will render correctly.
+💩 💨 ❤ 😀 😂 😍 😘 😎 🤣 👍 👋 ⭐ 🎉 🍕 ⚽ 🦖 😴 🏠 🚗 ✅
+Others will show as an empty box.
 
 ## Reply buttons
 
@@ -114,7 +116,7 @@ Saved sets, editable at the top of `beanstalk.py`:
 | Name | Buttons |
 |---|---|
 | `answer` | yes, no, not yet |
-| `silly` | PFFFT 💨, poop, you smell |
+| `silly` | fart, poop, you smell |
 
 Fewer than three leaves the extras blank. Labels over 32 characters are
 refused.

@@ -161,7 +161,7 @@ MAX_LABEL_CHARS = 32
 # the three it holds in firmware, so that set lives in one place.
 PRESETS = {
     "answer":  ["yes", "no", "not yet"],
-    "silly":   ["PFFFT", "poop", "you smell"],
+    "silly":   ["fart", "poop", "you smell"],
 }
 
 # The device publishes battery every 300s, which makes a free heartbeat. Silence
