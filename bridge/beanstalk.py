@@ -494,7 +494,7 @@ def handle_update(client, upd):
     if cmd == "/joke" or cmd.startswith("/joke "):
         one = text.strip()[len("/joke"):].strip()
         if not one:
-            tg_send("<code>/joke What is invisible and smells like carrots? | "
+            tg_send("<code>/joke What is invisible and | smells like carrots? | "
                     "Bunny farts.</code>\n\n"
                     "<code>|</code> is a line break on the screen. Adds to the "
                     "current bundle; the oldest drops off at "
