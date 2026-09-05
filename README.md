@@ -78,11 +78,11 @@ Put `secrets.yaml` in the repo root, then:
 
     cp sticky.yaml.example sticky.yaml
 
-Once `sticky.yaml` exists, a
-card named reTerminal_Sticky appears in Device Builder.
+Once `sticky.yaml` exists, a card named reTerminal_Sticky appears in Device
+Builder. 
 
-Open the card's menu and choose Validate. Fix anything it reports before
-flashing. Click Install.
+Click on the dropdown on the right and select Validate. Fix anything it
+reports. Then Install (the upload arrow does the same).
 
 The first flash is over USB, select Plug into this Computer:
 
