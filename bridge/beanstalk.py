@@ -246,6 +246,7 @@ state = {
     "mqtt_down_since": 0.0,
     "mqtt_alerted": False,
     "last_battery": None,
+    "battery_live": False,      # False when last_battery came from a retained replay
     "buttons": None,            # from TOPIC_BUTTONS, the device's own copy
     "jokes": [],                # from TOPIC_JOKES_ACTIVE, what is on screen
     "version": None,            # from TOPIC_VERSION
@@ -381,6 +382,7 @@ def tg_status():
     with state_lock:
         last = state["last_device_msg"]
         batt = state["last_battery"]
+        batt_live = state["battery_live"]
         up = state["mqtt_up"]
         ver = state["version"]
         pending = state["ota_pending"]
@@ -393,7 +395,8 @@ def tg_status():
     out = (
         f"broker: {'connected' if up else 'DISCONNECTED'}\n"
         f"last heard from Sticky: {heard}\n"
-        f"battery: {batt if batt is not None else 'unknown'}\n"
+        f"battery: {batt if batt is not None else 'unknown'}"
+        f"{'' if batt is None or batt_live else ', as of last heard'}\n"
         f"firmware: {ver if ver else 'unknown'}"
     )
     if pending:
@@ -879,8 +882,13 @@ def on_message(client, userdata, msg):
             return
         with state_lock:
             state["last_battery"] = f"{pct:.0f}%"
+            state["battery_live"] = not msg.retain
             alerted = state["battery_alerted"]
-            if pct < LOW_BATTERY_PCT and not alerted:
+            if msg.retain:
+                # A replayed reading is as old as the panel's silence. Show
+                # it, do not alert on it; the live reading will.
+                notify = False
+            elif pct < LOW_BATTERY_PCT and not alerted:
                 state["battery_alerted"] = True
                 notify = True
             elif pct >= LOW_BATTERY_PCT + 10 and alerted:
