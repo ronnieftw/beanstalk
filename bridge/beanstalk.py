@@ -231,6 +231,8 @@ state = {
     "jokes": [],                # from TOPIC_JOKES_ACTIVE, what is on screen
     "version": None,            # from TOPIC_VERSION
     "ota_pending": None,        # URL on TOPIC_OTA, until flashed or failed
+    "ota_pulling": False,       # the panel said "pulling"; a version publish
+                                # after that means it rebooted
 }
 
 # --------------------------------------------------------------------------
@@ -398,6 +400,7 @@ def _clear_ota(client):
     client.publish(TOPIC_OTA, b"", qos=1, retain=True)
     with state_lock:
         state["ota_pending"] = None
+        state["ota_pulling"] = False
 
 
 def telegram_loop(client):
@@ -545,6 +548,7 @@ def handle_update(client, upd):
             return
         with state_lock:
             state["ota_pending"] = url
+            state["ota_pulling"] = False
         log.info("-> ota queued")
         tg_send("Update queued. The panel pulls it within 15 s of being online, "
                 "shows <b>updating</b>, and reboots. You hear back here either "
@@ -793,12 +797,20 @@ def on_message(client, userdata, msg):
         with state_lock:
             before = state["version"]
             state["version"] = payload
-        if before is not None and payload != before:
+            pulling = state["ota_pulling"]
+        if pulling:
+            # The panel reconnected after saying "pulling": it rebooted, so
+            # the flash completed even if "flashed" was lost in the reboot.
+            _clear_ota(client)
+            tg_send(f"Panel is back on firmware {html.escape(payload)}.")
+        elif before is not None and payload != before:
             tg_send(f"Panel is on firmware {html.escape(payload)}.")
         return
 
     if msg.topic == TOPIC_OTA_RESULT:
         if payload == "pulling":
+            with state_lock:
+                state["ota_pulling"] = True
             tg_send("Panel is pulling the update.", quiet=True)
         elif payload == "flashed":
             _clear_ota(client)

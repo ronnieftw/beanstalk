@@ -137,6 +137,14 @@ you would rather check that yourself.</p>
 </div>
 
 <div class="f">
+  <label for="ota_host">Remote update host</label>
+  <p class="help">Only if you host firmware for remote updates. Bare
+  hostname. The panel refuses firmware from any other host, and the bridge
+  only queues URLs on it. Leave blank if not.</p>
+  <input id="ota_host" placeholder="ota.example.com">
+</div>
+
+<div class="f">
   <label for="ota_http_username">Remote update username</label>
   <p class="help">Only if you host firmware for remote updates. The panel
   sends this pair as HTTP basic auth when it pulls a build. Set the same pair
@@ -274,7 +282,7 @@ Telegram.</p>
 "use strict";
 
 const KEYS = ["sender_name","wifi_ssid","wifi_password","wifi_ssid_alt",
- "wifi_password_alt","ap_password","ota_password","ota_http_username",
+ "wifi_password_alt","ap_password","ota_password","ota_host","ota_http_username",
  "ota_http_password","mqtt_broker","mqtt_port",
  "mqtt_username","mqtt_password","bridge_mqtt_username","bridge_mqtt_password",
  "telegram_token","telegram_chat_id","pi_host","bridge_mqtt_client_id",
@@ -427,6 +435,7 @@ ota_password: ${q(val("ota_password"))}
 # Basic auth the panel sends when it pulls a firmware build over HTTPS
 # (remote updates). The same pair is set on the server. Placeholders are
 # harmless if you do not host firmware.
+ota_host: ${q(val("ota_host") || "...")}
 ota_http_username: ${q(val("ota_http_username") || "...")}
 ota_http_password: ${q(val("ota_http_password") || "...")}
 
@@ -469,6 +478,10 @@ TOPIC_PREFIX=${val("topic_prefix")}
 # or off wifi.
 DEVICE_SILENT_MINUTES=${val("silent_minutes")}
 LOW_BATTERY_PCT=${val("low_battery")}
+
+# Where firmware builds are hosted for /update. Bare hostname. Blank turns
+# /update off.
+OTA_HOST=${val("ota_host")}
 `;
 }
 

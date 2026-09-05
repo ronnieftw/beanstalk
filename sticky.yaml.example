@@ -42,6 +42,11 @@ substitutions:
   # Published on sticky/version after every connect, so the bridge can report
   # a remote update. Bump it with every release.
   fw_version: "34"
+  # The only host a remote update may be pulled from. Anything with the
+  # broker credential can write sticky/ota; without this pin it could point
+  # the panel at its own server, receive the basic-auth pair, and serve any
+  # firmware it liked.
+  ota_host: !secret ota_host
 
 esphome:
   name: ${device_name}
@@ -1227,6 +1232,19 @@ interval:
             lambda: 'return !id(ota_url).empty() && id(ota_url) == id(ota_done_url);'
           then:
             - lambda: 'id(ota_url).clear();'
+      # A URL on any other host is dropped, and said so, before any request
+      # is made. See ota_host in substitutions.
+      - if:
+          condition:
+            lambda: |-
+              return !id(ota_url).empty() &&
+                     id(ota_url).rfind("https://${ota_host}/", 0) != 0;
+          then:
+            - lambda: 'id(ota_url).clear();'
+            - mqtt.publish:
+                topic: sticky/ota_result
+                payload: "failed host"
+                qos: 1
       # Remote update. The pull blocks the loop until the panel reboots on
       # success or on_error fires; see the ota: block.
       - if:
