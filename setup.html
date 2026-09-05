@@ -136,6 +136,22 @@ you would rather check that yourself.</p>
   </div>
 </div>
 
+<div class="f">
+  <label for="ota_http_username">Remote update username</label>
+  <p class="help">Only if you host firmware for remote updates. The panel
+  sends this pair as HTTP basic auth when it pulls a build. Set the same pair
+  on the server. Leave blank if not.</p>
+  <input id="ota_http_username" value="sticky">
+</div>
+
+<div class="f">
+  <label for="ota_http_password">Remote update password</label>
+  <div class="row">
+    <input id="ota_http_password">
+    <button type="button" onclick="gen('ota_http_password')">Generate</button>
+  </div>
+</div>
+
 <h2>The broker</h2>
 
 <p class="note">Both ends dial out to a hosted MQTT broker, so neither your
@@ -258,7 +274,8 @@ Telegram.</p>
 "use strict";
 
 const KEYS = ["sender_name","wifi_ssid","wifi_password","wifi_ssid_alt",
- "wifi_password_alt","ap_password","ota_password","mqtt_broker","mqtt_port",
+ "wifi_password_alt","ap_password","ota_password","ota_http_username",
+ "ota_http_password","mqtt_broker","mqtt_port",
  "mqtt_username","mqtt_password","bridge_mqtt_username","bridge_mqtt_password",
  "telegram_token","telegram_chat_id","pi_host","bridge_mqtt_client_id",
  "topic_prefix","silent_minutes","low_battery"];
@@ -406,6 +423,12 @@ ap_password: ${q(val("ap_password"))}
 
 # Guards firmware updates sent over wifi.
 ota_password: ${q(val("ota_password"))}
+
+# Basic auth the panel sends when it pulls a firmware build over HTTPS
+# (remote updates). The same pair is set on the server. Placeholders are
+# harmless if you do not host firmware.
+ota_http_username: ${q(val("ota_http_username") || "...")}
+ota_http_password: ${q(val("ota_http_password") || "...")}
 
 # The panel's own broker credential. The bridge uses a different one.
 mqtt_broker: ${q(val("mqtt_broker"))}

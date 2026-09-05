@@ -39,10 +39,16 @@ substitutions:
   sender_name: !secret sender_name
   # Read off the screen and found in a phone's wifi list.
   ap_ssid: "Beanstalk Setup"
+  # Published on sticky/version after every connect, so the bridge can report
+  # a remote update. Bump it with every release.
+  fw_version: "34"
 
 esphome:
   name: ${device_name}
   friendly_name: ${friendly_name}
+  project:
+    name: "ronnieftw.beanstalk"
+    version: "${fw_version}"
   on_boot:
     - priority: 600
       then:
@@ -508,6 +514,28 @@ globals:
     restore_value: yes
     max_restore_data_length: 240
     initial_value: '""'
+
+  # Remote update. The URL arrives on sticky/ota and the 15s interval acts on
+  # it. ota_done_url is the last URL that flashed: the bridge retains the
+  # message, so it replays after the reboot and must not flash again.
+  - id: ota_url
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: ota_done_url
+    type: std::string
+    restore_value: yes
+    max_restore_data_length: 120
+    initial_value: '""'
+  - id: ota_screen
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # sticky/version goes out once per broker connection, from the interval.
+  - id: version_sent
+    type: bool
+    restore_value: no
+    initial_value: 'false'
 
   - id: msg_time
     type: time_t
@@ -1181,6 +1209,42 @@ interval:
   - interval: 15s
     then:
       - script.execute: try_flush
+      # Version, once per connection. Not from on_connect; see publish_buttons.
+      - if:
+          condition:
+            lambda: 'return !id(version_sent) && id(link_up);'
+          then:
+            - mqtt.publish:
+                topic: sticky/version
+                payload: "${fw_version}"
+                qos: 1
+                retain: true
+            - lambda: 'id(version_sent) = true;'
+      # A URL that already flashed: the retained sticky/ota replayed after the
+      # reboot. Drop it.
+      - if:
+          condition:
+            lambda: 'return !id(ota_url).empty() && id(ota_url) == id(ota_done_url);'
+          then:
+            - lambda: 'id(ota_url).clear();'
+      # Remote update. The pull blocks the loop until the panel reboots on
+      # success or on_error fires; see the ota: block.
+      - if:
+          condition:
+            lambda: 'return !id(ota_url).empty() && id(link_up) && !id(ap_hint);'
+          then:
+            - mqtt.publish:
+                topic: sticky/ota_result
+                payload: "pulling"
+                qos: 1
+            - lambda: 'id(ota_screen) = true;'
+            - script.execute: redraw
+            - script.wait: redraw
+            - ota.http_request.flash:
+                url: !lambda 'return id(ota_url);'
+                md5_url: !lambda 'return id(ota_url) + ".md5";'
+                username: !secret ota_http_username
+                password: !secret ota_http_password
       # Is the fallback AP up, and has it been up long enough to say so.
       #
       # Whether it is up comes from the captive portal, which starts and stops
@@ -1367,6 +1431,17 @@ display:
       }
 
       auto now = id(rtc_time).now();
+
+      // =================================================================
+      // UPDATING. Drawn once before a remote firmware pull. The pull blocks
+      // everything until the panel reboots or on_error redraws.
+      // =================================================================
+      if (id(ota_screen)) {
+        it.print(W / 2, 300, id(font_large), COLOR_OFF, TextAlign::TOP_CENTER, "updating");
+        it.print(W / 2, 380, id(font_medium), COLOR_OFF, TextAlign::TOP_CENTER, "do not unplug");
+        it.print(W / 2, 440, id(font_small), COLOR_OFF, TextAlign::TOP_CENTER, "from version ${fw_version}");
+        return;
+      }
 
       // =================================================================
       // IMPACT. A new message takes the whole panel, inverted, until touched.
@@ -1683,9 +1758,40 @@ wifi:
 
 captive_portal:
 
+# =============================================================================
+# Updates
+#
+# Two paths. The esphome platform is Device Builder over the LAN. The
+# http_request platform pulls a build over HTTPS when the bridge puts a URL on
+# sticky/ota; the 15s interval starts the pull.
+# =============================================================================
+
+http_request:
+  verify_ssl: true
+  timeout: 30s
+  # Cloudflare response headers run to a few hundred bytes each. The 512
+  # default fails on them.
+  buffer_size_rx: 2048
+
 ota:
   - platform: esphome
     password: !secret ota_password
+  - platform: http_request
+    on_end:
+      # Success, just before the reboot. safe_reboot syncs preferences, so
+      # ota_done_url survives and the retained replay is dropped after boot.
+      - lambda: 'id(ota_done_url) = id(ota_url);'
+      - mqtt.publish:
+          topic: sticky/ota_result
+          payload: "flashed"
+          qos: 1
+    on_error:
+      - lambda: 'id(ota_screen) = false; id(ota_url).clear();'
+      - mqtt.publish:
+          topic: sticky/ota_result
+          payload: !lambda 'return "failed " + std::to_string((int) x);'
+          qos: 1
+      - script.execute: redraw
 
 # =============================================================================
 # MQTT
@@ -1764,8 +1870,20 @@ mqtt:
     - lambda: 'id(buttons_dirty) = true;'
     - script.execute: redraw
   on_disconnect:
-    - lambda: 'id(link_up) = false;'
+    - lambda: 'id(link_up) = false; id(version_sent) = false;'
     - script.execute: show_offline
+  on_message:
+    # Remote update. The bridge retains the URL here and clears it when the
+    # version changes or the pull fails. Empty payload clears.
+    - topic: sticky/ota
+      qos: 1
+      then:
+        - lambda: |-
+            std::string u = x;
+            size_t a = u.find_first_not_of(" \t\r\n");
+            if (a == std::string::npos) { id(ota_url).clear(); return; }
+            size_t b = u.find_last_not_of(" \t\r\n");
+            id(ota_url) = u.substr(a, b - a + 1);
 
 # =============================================================================
 # Inbound
