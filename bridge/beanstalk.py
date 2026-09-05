@@ -60,6 +60,10 @@ TELEGRAM_TOKEN = _need("TELEGRAM_TOKEN")
 STATE_DIR = os.environ.get("STATE_DIR", "/var/lib/beanstalk")
 _CHAT_FILE = os.path.join(STATE_DIR, "chat_id")
 _CODE_FILE = os.path.join(STATE_DIR, "pairing_code")
+# When the panel last spoke, as a unix time. Kept on disk so a bridge restart
+# does not reset "last heard" to the restart, and so a panel that was already
+# silent is reported at its true age.
+_SEEN_FILE = os.path.join(STATE_DIR, "last_seen")
 
 _PAIR_WORDS = ("amber anchor badger bamboo beacon cedar cobalt comet copper "
                "cricket delta ember falcon fennel garnet ginger granite "
@@ -120,6 +124,9 @@ TOPIC_TO_KID = f"{PREFIX}/to_kid"
 TOPIC_FROM_KID = f"{PREFIX}/from_kid"
 TOPIC_SEEN = f"{PREFIX}/seen"
 TOPIC_BATTERY = f"{PREFIX}/sensor/battery_level/state"
+# Unix time of the panel's last battery publish, retained by the panel. The
+# only timestamp that survives on the broker; read at start.
+TOPIC_HEARTBEAT = f"{PREFIX}/heartbeat"
 # The device publishes its current triad here, retained. It is the source of
 # truth: the labels live in the device's flash and survive reboots, while this
 # service does not, so a copy kept here would go stale on the first restart.
@@ -219,8 +226,20 @@ def check_credentials():
 # --------------------------------------------------------------------------
 
 state_lock = threading.Lock()
+def _load_last_seen():
+    """None when nothing is known: no file yet, and no retained heartbeat
+    seen. tg_status says so rather than showing the restart time."""
+    try:
+        return float(_read(_SEEN_FILE))
+    except ValueError:
+        return None
+
+
+STARTED_AT = time.time()
+
 state = {
-    "last_device_msg": time.time(),  # any live message from the panel
+    "last_device_msg": _load_last_seen(),  # any live message from the panel
+    "last_seen_written": 0.0,   # throttle for _SEEN_FILE
     "device_alerted": False,    # have we already said it went quiet
     "battery_alerted": False,   # have we already said the battery is low
     "mqtt_up": False,
@@ -369,7 +388,8 @@ def tg_status():
         age = int(time.time() - last)
         heard = f"{age // 60}m {age % 60}s ago" if age >= 60 else f"{age}s ago"
     else:
-        heard = "never"
+        age = int(time.time() - STARTED_AT)
+        heard = f"not since the bridge started, {age // 60}m ago"
     out = (
         f"broker: {'connected' if up else 'DISCONNECTED'}\n"
         f"last heard from Sticky: {heard}\n"
@@ -736,7 +756,8 @@ def on_connect(client, userdata, flags, rc, properties=None):
     # QoS 1 with clean_session False is what makes the broker hold messages for
     # this bridge while it is restarting.
     for t in (TOPIC_FROM_KID, TOPIC_SEEN, TOPIC_BATTERY, TOPIC_BUTTONS,
-              TOPIC_JOKES_ACTIVE, TOPIC_OTA_RESULT, TOPIC_VERSION, TOPIC_OTA):
+              TOPIC_JOKES_ACTIVE, TOPIC_OTA_RESULT, TOPIC_VERSION, TOPIC_OTA,
+              TOPIC_HEARTBEAT):
         client.subscribe(t, qos=1)
     if was_down:
         tg_send("Beanstalk is back on the broker.")
@@ -769,6 +790,20 @@ def on_message(client, userdata, msg):
             state["ota_pending"] = payload or None
         return
 
+    # The panel's own clock, retained. On a retained replay it is the only
+    # source for "last heard" a fresh bridge has; live, it is a heartbeat like
+    # any other message and the block below handles that.
+    if msg.topic == TOPIC_HEARTBEAT and msg.retain:
+        try:
+            ts = float(payload)
+        except ValueError:
+            return
+        with state_lock:
+            last = state["last_device_msg"]
+            if last is None or ts > last:
+                state["last_device_msg"] = ts
+        return
+
     # A retained message is the broker replaying its last copy, not the panel
     # speaking. It arrives on every (re)connect, so counting it as a heartbeat
     # would reset the silence alert each time this bridge reconnects.
@@ -778,6 +813,14 @@ def on_message(client, userdata, msg):
             was_alerted = state["device_alerted"]
             state["last_device_msg"] = now
             state["device_alerted"] = False
+            persist = now - state["last_seen_written"] > 60
+            if persist:
+                state["last_seen_written"] = now
+        if persist:
+            try:
+                _write(_SEEN_FILE, int(now))
+            except OSError as e:
+                log.warning("could not write %s: %s", _SEEN_FILE, e)
         if was_alerted:
             tg_send("Sticky is back online.")
 
@@ -865,6 +908,8 @@ def watchdog():
         now = time.time()
         with state_lock:
             last = state["last_device_msg"]
+            if last is None:
+                last = STARTED_AT
             dev_alerted = state["device_alerted"]
             up = state["mqtt_up"]
             down_since = state["mqtt_down_since"]
@@ -884,8 +929,12 @@ def watchdog():
                 state["mqtt_alerted"] = True
 
         if device_quiet:
+            age = int(now - last) // 60
+            since = (f"{age} minutes" if age < 120 else
+                     f"{age // 60} hours" if age < 2880 else
+                     f"{age // 1440} days")
             tg_send(
-                f"No word from Sticky for {SILENT_MINUTES} minutes. "
+                f"No word from Sticky for {since}. "
                 "It is powered off, flat, or off wifi. "
                 "The panel shows the last message either way."
             )

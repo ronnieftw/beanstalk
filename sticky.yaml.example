@@ -229,6 +229,19 @@ sensor:
     state_class: measurement
     accuracy_decimals: 0
     update_interval: 300s
+    # A retained timestamp next to every battery publish. The battery value
+    # is retained too, but a retained message carries no time, so a bridge
+    # starting from nothing could not say when the panel last spoke.
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(rtc_time).now().is_valid();'
+          then:
+            - mqtt.publish:
+                topic: sticky/heartbeat
+                payload: !lambda 'return std::to_string(id(rtc_time).now().timestamp);'
+                qos: 1
+                retain: true
     lambda: |-
       uint8_t reg = 0x2C;
       uint8_t raw[2] = {0, 0};
