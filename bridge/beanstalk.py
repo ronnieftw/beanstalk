@@ -138,6 +138,19 @@ TOPIC_JOKES_ACTIVE = f"{PREFIX}/jokes_active"
 # breaks this.
 TOPIC_RESTART = f"{PREFIX}/button/restart_device/command"
 
+# Remote firmware update. /update puts a URL on TOPIC_OTA, retained, and the
+# panel pulls it. The panel answers on TOPIC_OTA_RESULT (pulling, flashed,
+# failed N) and publishes TOPIC_VERSION, retained, after every connect.
+TOPIC_OTA = f"{PREFIX}/ota"
+TOPIC_OTA_RESULT = f"{PREFIX}/ota_result"
+TOPIC_VERSION = f"{PREFIX}/version"
+# The only host /update accepts. Blank disables /update.
+OTA_HOST = os.environ.get("OTA_HOST", "").strip().lower()
+# Lines of "<version> <folder>", appended by publish-firmware over ssh. The
+# folder name is random and stays out of Telegram; /update <version> looks it
+# up here. Last line for a version wins.
+_RELEASES_FILE = os.path.join(STATE_DIR, "releases")
+
 # One MQTT message has to carry the whole bundle, and the device parses it into
 # RAM on every joke render. Twenty at about 90 bytes each is 1.8KB. Check the
 # device still renders before raising either.
@@ -216,6 +229,8 @@ state = {
     "last_battery": None,
     "buttons": None,            # from TOPIC_BUTTONS, the device's own copy
     "jokes": [],                # from TOPIC_JOKES_ACTIVE, what is on screen
+    "version": None,            # from TOPIC_VERSION
+    "ota_pending": None,        # URL on TOPIC_OTA, until flashed or failed
 }
 
 # --------------------------------------------------------------------------
@@ -267,8 +282,9 @@ HELP = (
     "<code>/jokes</code> — what is loaded\n"
     "<code>/joke &lt;text&gt;</code> — add one\n"
     "<code>/jokes default</code> — back to the twenty in the firmware\n\n"
-    "/status — link and battery\n"
-    "/reboot — restart the panel"
+    "/status — link, battery and firmware\n"
+    "/reboot — restart the panel\n"
+    "/update &lt;url&gt; — update the panel's firmware"
 )
 
 # Paste into BotFather /setcommands so Telegram autocompletes these. Without
@@ -278,7 +294,8 @@ BOTFATHER_COMMANDS = (
     "jokes - show or replace the joke bundle\n"
     "joke - add one joke\n"
     "reboot - restart the panel\n"
-    "status - link and battery\n"
+    "update - update the panel's firmware\n"
+    "status - link, battery and firmware\n"
     "help - how this works"
 )
 
@@ -344,16 +361,43 @@ def tg_status():
         last = state["last_device_msg"]
         batt = state["last_battery"]
         up = state["mqtt_up"]
+        ver = state["version"]
+        pending = state["ota_pending"]
     if last:
         age = int(time.time() - last)
         heard = f"{age // 60}m {age % 60}s ago" if age >= 60 else f"{age}s ago"
     else:
         heard = "never"
-    return (
+    out = (
         f"broker: {'connected' if up else 'DISCONNECTED'}\n"
         f"last heard from Sticky: {heard}\n"
-        f"battery: {batt if batt is not None else 'unknown'}"
+        f"battery: {batt if batt is not None else 'unknown'}\n"
+        f"firmware: {ver if ver else 'unknown'}"
     )
+    if pending:
+        out += "\nupdate queued, waiting for the panel"
+    return out
+
+
+def _releases():
+    """{version: folder} from the file publish-firmware maintains."""
+    out = {}
+    try:
+        with open(_RELEASES_FILE, encoding="utf-8") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) == 2 and re.fullmatch(r"[A-Za-z0-9._-]+", parts[1]):
+                    out[parts[0].lstrip("v")] = parts[1]
+    except OSError:
+        pass
+    return out
+
+
+def _clear_ota(client):
+    """Remove the retained URL so a reconnecting panel does not see it."""
+    client.publish(TOPIC_OTA, b"", qos=1, retain=True)
+    with state_lock:
+        state["ota_pending"] = None
 
 
 def telegram_loop(client):
@@ -449,6 +493,62 @@ def handle_update(client, upd):
         # For pasting into BotFather. Not sent to the panel.
         tg_send("Paste into BotFather /setcommands:\n\n<code>"
                 + BOTFATHER_COMMANDS + "</code>")
+        return
+
+    if cmd == "/update" or cmd.startswith("/update "):
+        arg = text.strip()[len("/update"):].strip()
+        with state_lock:
+            ver = state["version"]
+            pending = state["ota_pending"]
+        if not OTA_HOST:
+            tg_send("No OTA_HOST in beanstalk.env, so /update is off.")
+            return
+        if not arg:
+            known = sorted(_releases(), key=lambda v: (len(v), v))
+            avail = ("published: " + ", ".join(known[-5:])) if known else \
+                    "nothing published yet"
+            if pending:
+                tail = ("queued, waiting for the panel. "
+                        "<code>/update cancel</code> to withdraw it.")
+            elif known:
+                tail = f"<code>/update {known[-1]}</code> to queue one."
+            else:
+                tail = ""
+            tg_send(f"firmware: {ver if ver else 'unknown'}\n{avail}\n{tail}")
+            return
+        if arg.lower() == "cancel":
+            _clear_ota(client)
+            tg_send("Update withdrawn." if pending else "Nothing was queued.")
+            return
+        # A version number, as publish-firmware prints it. A full URL on the
+        # host is also accepted.
+        m = re.fullmatch(r"v?(\d{1,6})", arg)
+        if m:
+            folder = _releases().get(m.group(1))
+            if not folder:
+                tg_send(f"No version {m.group(1)} registered on the Pi. "
+                        "publish-firmware registers each build it publishes.")
+                return
+            url = f"https://{OTA_HOST}/{folder}/firmware.ota.bin"
+        else:
+            url = arg.split()[0]
+            if not url.lower().startswith(f"https://{OTA_HOST}/") \
+                    or not url.endswith("firmware.ota.bin") or " " in arg:
+                tg_send("A version number, as in <code>/update 35</code>, or "
+                        f"a <code>https://{OTA_HOST}/.../firmware.ota.bin</code> "
+                        "URL.")
+                return
+        info = client.publish(TOPIC_OTA, url.encode("utf-8"), qos=1, retain=True)
+        if info.rc != mqtt.MQTT_ERR_SUCCESS:
+            log.warning("publish to ota failed rc=%s", info.rc)
+            tg_send("Could not reach the broker, so nothing was queued.")
+            return
+        with state_lock:
+            state["ota_pending"] = url
+        log.info("-> ota queued")
+        tg_send("Update queued. The panel pulls it within 15 s of being online, "
+                "shows <b>updating</b>, and reboots. You hear back here either "
+                f"way.\nNow on firmware {ver if ver else 'unknown'}.")
         return
 
     if cmd in ("/reboot", "/restart"):
@@ -632,7 +732,7 @@ def on_connect(client, userdata, flags, rc, properties=None):
     # QoS 1 with clean_session False is what makes the broker hold messages for
     # this bridge while it is restarting.
     for t in (TOPIC_FROM_KID, TOPIC_SEEN, TOPIC_BATTERY, TOPIC_BUTTONS,
-              TOPIC_JOKES_ACTIVE):
+              TOPIC_JOKES_ACTIVE, TOPIC_OTA_RESULT, TOPIC_VERSION, TOPIC_OTA):
         client.subscribe(t, qos=1)
     if was_down:
         tg_send("Beanstalk is back on the broker.")
@@ -658,6 +758,13 @@ def on_message(client, userdata, msg):
              " (retained)" if msg.retain else "")
     log.debug("<- %s: %r", msg.topic, payload)
 
+    # Our own retained URL, echoed back. Tells a restarted bridge what is
+    # queued. Not the panel speaking, so it sits above the heartbeat below.
+    if msg.topic == TOPIC_OTA:
+        with state_lock:
+            state["ota_pending"] = payload or None
+        return
+
     # A retained message is the broker replaying its last copy, not the panel
     # speaking. It arrives on every (re)connect, so counting it as a heartbeat
     # would reset the silence alert each time this bridge reconnects.
@@ -680,6 +787,28 @@ def on_message(client, userdata, msg):
     if msg.topic == TOPIC_BUTTONS:
         with state_lock:
             state["buttons"] = payload
+        return
+
+    if msg.topic == TOPIC_VERSION:
+        with state_lock:
+            before = state["version"]
+            state["version"] = payload
+        if before is not None and payload != before:
+            tg_send(f"Panel is on firmware {html.escape(payload)}.")
+        return
+
+    if msg.topic == TOPIC_OTA_RESULT:
+        if payload == "pulling":
+            tg_send("Panel is pulling the update.", quiet=True)
+        elif payload == "flashed":
+            _clear_ota(client)
+            tg_send("Flashed. The panel is rebooting.")
+        elif payload.startswith("failed"):
+            _clear_ota(client)
+            tg_send(f"Update failed ({html.escape(payload)}). The panel kept "
+                    "the old firmware.")
+        else:
+            log.warning("unknown ota_result %r", payload)
         return
 
     if msg.topic == TOPIC_FROM_KID:

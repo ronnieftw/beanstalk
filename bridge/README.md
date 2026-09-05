@@ -81,7 +81,8 @@ Then send `/setcommands` to `@BotFather` and paste the block to enable autocompl
     jokes - show or replace the joke bundle
     joke - add one joke
     reboot - restart the panel
-    status - link and battery
+    update - update the panel's firmware
+    status - link, battery and firmware
     help - how this works
 
 
@@ -155,7 +156,8 @@ Replacing the whole set is the `.txt` file only.
 
     /status
 
-Reports the broker link, when the panel last checked in, and its battery.
+Reports the broker link, when the panel last checked in, its battery, and its
+firmware version.
 
 You are also told, without asking, when the battery drops below 15%, when the
 panel has been silent for twenty minutes, and when the bridge loses the broker
@@ -169,6 +171,25 @@ Restarts the panel. Messages, buttons, jokes and settings survive.
 
 If the panel has lost wifi the command never arrives. The panel then raises
 its own network and shows setup instructions on screen.
+
+## Update
+
+    /update 35           install version 35
+    /update              firmware version and whether an update is queued
+    /update cancel       withdraw a queued update
+
+The number is the `fw_version` the build was published under. The publish
+script registers each build in `/var/lib/beanstalk/releases` on the Pi, one
+line of `<version> <folder>`, and prints the line to send; the folder name
+never appears in chat. The panel pulls the file, checks it, shows `updating`,
+flashes and reboots.
+You get `Panel is pulling the update`, then `Flashed`, then
+`Panel is on firmware <n>`. On a failure you get the reason and the panel
+keeps what it had.
+
+Only URLs on the host in `OTA_HOST` (`beanstalk.env`) are accepted. Blank
+turns the command off. Hosting the file, with the auth the panel expects, is
+in the main README under Flashing the panel.
 
 ## Small things
 
